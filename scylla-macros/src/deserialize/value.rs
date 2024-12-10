@@ -5,6 +5,8 @@ use proc_macro::TokenStream;
 use proc_macro2::Span;
 use syn::{ext::IdentExt, parse_quote};
 
+use crate::Flavor;
+
 use super::{DeserializeCommonFieldAttrs, DeserializeCommonStructAttrs};
 
 #[derive(FromAttributes)]
@@ -13,12 +15,8 @@ struct StructAttrs {
     #[darling(rename = "crate")]
     crate_path: Option<syn::Path>,
 
-    // If true, then the type checking code will require the order of the fields
-    // to be the same in both the Rust struct and the UDT. This allows the
-    // deserialization to be slightly faster because looking struct fields up
-    // by name can be avoided, though it is less convenient.
     #[darling(default)]
-    enforce_order: bool,
+    flavor: Flavor,
 
     // If true, then the type checking code won't verify the UDT field names.
     // UDT fields will be matched to struct fields based solely on the order.
@@ -112,9 +110,10 @@ fn validate_attrs(attrs: &StructAttrs, fields: &[Field]) -> Result<(), darling::
 
     if attrs.skip_name_checks {
         // Skipping name checks is only available in enforce_order mode
-        if !attrs.enforce_order {
-            let error =
-                darling::Error::custom("attribute <skip_name_checks> requires <enforce_order>.");
+        if attrs.flavor != Flavor::EnforceOrder {
+            let error = darling::Error::custom(
+                "attribute <skip_name_checks> requires <flavor = enforce_order>.",
+            );
             errors.push(error);
         }
 
@@ -207,25 +206,23 @@ impl StructDesc {
     }
 
     fn generate_type_check_method(&self) -> syn::ImplItemFn {
-        if self.attrs.enforce_order {
-            TypeCheckAssumeOrderGenerator(self).generate()
-        } else {
-            TypeCheckUnorderedGenerator(self).generate()
+        match self.attrs.flavor {
+            Flavor::MatchByName => TypeCheckUnorderedGenerator(self).generate(),
+            Flavor::EnforceOrder => TypeCheckAssumeOrderGenerator(self).generate(),
         }
     }
 
     fn generate_deserialize_method(&self) -> syn::ImplItemFn {
-        if self.attrs.enforce_order {
-            DeserializeAssumeOrderGenerator(self).generate()
-        } else {
-            DeserializeUnorderedGenerator(self).generate()
+        match self.attrs.flavor {
+            Flavor::MatchByName => DeserializeUnorderedGenerator(self).generate(),
+            Flavor::EnforceOrder => DeserializeAssumeOrderGenerator(self).generate(),
         }
     }
 }
 
 struct TypeCheckAssumeOrderGenerator<'sd>(&'sd StructDesc);
 
-impl<'sd> TypeCheckAssumeOrderGenerator<'sd> {
+impl TypeCheckAssumeOrderGenerator<'_> {
     // Generates name and type validation for given Rust struct's field.
     fn generate_field_validation(&self, rust_field_idx: usize, field: &Field) -> syn::Expr {
         let macro_internal = self.0.struct_attrs().macro_internal_path();
@@ -401,7 +398,7 @@ impl<'sd> TypeCheckAssumeOrderGenerator<'sd> {
 
 struct DeserializeAssumeOrderGenerator<'sd>(&'sd StructDesc);
 
-impl<'sd> DeserializeAssumeOrderGenerator<'sd> {
+impl DeserializeAssumeOrderGenerator<'_> {
     fn generate_finalize_field(&self, field: &Field) -> syn::Expr {
         if field.skip {
             // Skipped fields are initialized with Default::default()
@@ -569,7 +566,7 @@ impl<'sd> DeserializeAssumeOrderGenerator<'sd> {
 
 struct TypeCheckUnorderedGenerator<'sd>(&'sd StructDesc);
 
-impl<'sd> TypeCheckUnorderedGenerator<'sd> {
+impl TypeCheckUnorderedGenerator<'_> {
     // An identifier for a bool variable that represents whether given
     // field was already visited during type check
     fn visited_flag_variable(field: &Field) -> syn::Ident {
@@ -733,7 +730,7 @@ impl<'sd> TypeCheckUnorderedGenerator<'sd> {
 
 struct DeserializeUnorderedGenerator<'sd>(&'sd StructDesc);
 
-impl<'sd> DeserializeUnorderedGenerator<'sd> {
+impl DeserializeUnorderedGenerator<'_> {
     /// An identifier for a variable that is meant to store the parsed variable
     /// before being ultimately moved to the struct on deserialize.
     fn deserialize_field_variable(field: &Field) -> syn::Ident {

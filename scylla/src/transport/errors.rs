@@ -13,26 +13,32 @@ use std::{
 };
 
 use scylla_cql::{
-    cql_to_rust::FromRowError,
     frame::{
         frame_errors::{
             CqlAuthChallengeParseError, CqlAuthSuccessParseError, CqlAuthenticateParseError,
             CqlErrorParseError, CqlEventParseError, CqlRequestSerializationError,
             CqlResponseParseError, CqlResultParseError, CqlSupportedParseError,
-            FrameBodyExtensionsParseError, FrameHeaderParseError, RowsParseError,
+            FrameBodyExtensionsParseError, FrameHeaderParseError,
         },
         request::CqlRequestKind,
         response::CqlResponseKind,
         value::SerializeValuesError,
     },
-    types::serialize::SerializationError,
+    types::{
+        deserialize::{DeserializationError, TypeCheckError},
+        serialize::SerializationError,
+    },
 };
 
 use thiserror::Error;
 
 use crate::{authentication::AuthError, frame::response};
 
-use super::query_result::{RowsExpectedError, SingleRowTypedError};
+use super::{
+    iterator::NextRowError,
+    legacy_query_result::IntoLegacyQueryResultError,
+    query_result::{IntoRowsResultError, SingleRowError},
+};
 
 /// Error that occurred during query execution
 #[derive(Error, Debug, Clone)]
@@ -98,6 +104,19 @@ pub enum QueryError {
     /// Client timeout occurred before any response arrived
     #[error("Request timeout: {0}")]
     RequestTimeout(String),
+
+    // TODO: This should not belong here, but it requires changes to error types
+    // returned in async iterator API. This should be handled in separate PR.
+    // The reason this needs to be included is that topology.rs makes use of iter API and returns QueryError.
+    // Once iter API is adjusted, we can then adjust errors returned by topology module (e.g. refactor MetadataError and not include it in QueryError).
+    /// An error occurred during async iteration over rows of result.
+    #[error("An error occurred during async iteration over rows of result: {0}")]
+    NextRowError(#[from] NextRowError),
+
+    /// Failed to convert [`QueryResult`][crate::transport::query_result::QueryResult]
+    /// into [`LegacyQueryResult`][crate::transport::legacy_query_result::LegacyQueryResult].
+    #[error("Failed to convert `QueryResult` into `LegacyQueryResult`: {0}")]
+    IntoLegacyQueryResultError(#[from] IntoLegacyQueryResultError),
 }
 
 impl From<SerializeValuesError> for QueryError {
@@ -162,6 +181,10 @@ impl From<QueryError> for NewSessionError {
             QueryError::BrokenConnection(e) => NewSessionError::BrokenConnection(e),
             QueryError::UnableToAllocStreamId => NewSessionError::UnableToAllocStreamId,
             QueryError::RequestTimeout(msg) => NewSessionError::RequestTimeout(msg),
+            QueryError::IntoLegacyQueryResultError(e) => {
+                NewSessionError::IntoLegacyQueryResultError(e)
+            }
+            QueryError::NextRowError(e) => NewSessionError::NextRowError(e),
         }
     }
 }
@@ -175,18 +198,6 @@ impl From<BadKeyspaceName> for QueryError {
 impl From<response::Error> for QueryError {
     fn from(error: response::Error) -> QueryError {
         QueryError::DbError(error.error, error.reason)
-    }
-}
-
-impl From<RowsParseError> for QueryError {
-    fn from(err: RowsParseError) -> Self {
-        let err: CqlResultParseError = err.into();
-        let err: CqlResponseParseError = err.into();
-        let err: RequestError = err.into();
-        let err: UserRequestError = err.into();
-        let err: QueryError = err.into();
-
-        err
     }
 }
 
@@ -264,6 +275,19 @@ pub enum NewSessionError {
     /// during `Session` creation.
     #[error("Client timeout: {0}")]
     RequestTimeout(String),
+
+    // TODO: This should not belong here, but it requires changes to error types
+    // returned in async iterator API. This should be handled in separate PR.
+    // The reason this needs to be included is that topology.rs makes use of iter API and returns QueryError.
+    // Once iter API is adjusted, we can then adjust errors returned by topology module (e.g. refactor MetadataError and not include it in QueryError).
+    /// An error occurred during async iteration over rows of result.
+    #[error("An error occurred during async iteration over rows of result: {0}")]
+    NextRowError(#[from] NextRowError),
+
+    /// Failed to convert [`QueryResult`][crate::transport::query_result::QueryResult]
+    /// into [`LegacyQueryResult`][crate::transport::legacy_query_result::LegacyQueryResult].
+    #[error("Failed to convert `QueryResult` into `LegacyQueryResult`: {0}")]
+    IntoLegacyQueryResultError(#[from] IntoLegacyQueryResultError),
 }
 
 /// A protocol error.
@@ -304,7 +328,7 @@ pub enum ProtocolError {
 
     /// A protocol error appeared during schema version fetch.
     #[error("Schema version fetch protocol error: {0}")]
-    SchemaVersionFetch(SingleRowTypedError),
+    SchemaVersionFetch(#[from] SchemaVersionFetchError),
 
     /// A result with nonfinished paging state received for unpaged query.
     #[error("Unpaged query returned a non-empty paging state! This is a driver-side or server-side bug.")]
@@ -345,25 +369,46 @@ pub enum UseKeyspaceProtocolError {
     UnexpectedResponse(CqlResponseKind),
 }
 
+/// A protocol error that occurred during schema version fetch.
+#[derive(Error, Debug, Clone)]
+#[non_exhaustive]
+pub enum SchemaVersionFetchError {
+    /// Failed to convert schema version query result into rows result.
+    #[error("Failed to convert schema version query result into rows result: {0}")]
+    TracesEventsIntoRowsResultError(IntoRowsResultError),
+
+    /// Failed to deserialize a single row from schema version query response.
+    #[error(transparent)]
+    SingleRowError(SingleRowError),
+}
+
 /// A protocol error that occurred during tracing info fetch.
 #[derive(Error, Debug, Clone)]
 #[non_exhaustive]
 pub enum TracingProtocolError {
-    /// Response to system_traces.session is not RESULT:Rows.
-    #[error("Response to system_traces.session is not RESULT:Rows: {0}")]
-    TracesSessionNotRows(RowsExpectedError),
+    /// Failed to convert result of system_traces.session query to rows result.
+    #[error("Failed to convert result of system_traces.session query to rows result")]
+    TracesSessionIntoRowsResultError(IntoRowsResultError),
 
     /// system_traces.session has invalid column type.
     #[error("system_traces.session has invalid column type: {0}")]
-    TracesSessionInvalidColumnType(FromRowError),
+    TracesSessionInvalidColumnType(TypeCheckError),
 
-    /// Response to system_traces.events is not RESULT:Rows.
-    #[error("Response to system_traces.events is not RESULT:Rows: {0}")]
-    TracesEventsNotRows(RowsExpectedError),
+    /// Response to system_traces.session failed to deserialize.
+    #[error("Response to system_traces.session failed to deserialize: {0}")]
+    TracesSessionDeserializationFailed(DeserializationError),
+
+    /// Failed to convert result of system_traces.events query to rows result.
+    #[error("Failed to convert result of system_traces.events query to rows result")]
+    TracesEventsIntoRowsResultError(IntoRowsResultError),
 
     /// system_traces.events has invalid column type.
     #[error("system_traces.events has invalid column type: {0}")]
-    TracesEventsInvalidColumnType(FromRowError),
+    TracesEventsInvalidColumnType(TypeCheckError),
+
+    /// Response to system_traces.events failed to deserialize.
+    #[error("Response to system_traces.events failed to deserialize: {0}")]
+    TracesEventsDeserializationFailed(DeserializationError),
 
     /// All tracing queries returned an empty result.
     #[error(
@@ -411,6 +456,14 @@ pub enum MetadataError {
 #[derive(Error, Debug, Clone)]
 #[non_exhaustive]
 pub enum PeersMetadataError {
+    /// system.peers has invalid column type.
+    #[error("system.peers has invalid column type: {0}")]
+    SystemPeersInvalidColumnType(TypeCheckError),
+
+    /// system.local has invalid column type.
+    #[error("system.local has invalid column type: {0}")]
+    SystemLocalInvalidColumnType(TypeCheckError),
+
     /// Empty peers list returned during peers metadata fetch.
     #[error("Peers list is empty")]
     EmptyPeers,
@@ -426,7 +479,7 @@ pub enum PeersMetadataError {
 pub enum KeyspacesMetadataError {
     /// system_schema.keyspaces has invalid column type.
     #[error("system_schema.keyspaces has invalid column type: {0}")]
-    SchemaKeyspacesInvalidColumnType(FromRowError),
+    SchemaKeyspacesInvalidColumnType(TypeCheckError),
 
     /// Bad keyspace replication strategy.
     #[error("Bad keyspace <{keyspace}> replication strategy: {error}")]
@@ -464,7 +517,7 @@ pub enum KeyspaceStrategyError {
 pub enum UdtMetadataError {
     /// system_schema.types has invalid column type.
     #[error("system_schema.types has invalid column type: {0}")]
-    SchemaTypesInvalidColumnType(FromRowError),
+    SchemaTypesInvalidColumnType(TypeCheckError),
 
     /// Circular UDT dependency detected.
     #[error("Detected circular dependency between user defined types - toposort is impossible!")]
@@ -477,11 +530,11 @@ pub enum UdtMetadataError {
 pub enum TablesMetadataError {
     /// system_schema.tables has invalid column type.
     #[error("system_schema.tables has invalid column type: {0}")]
-    SchemaTablesInvalidColumnType(FromRowError),
+    SchemaTablesInvalidColumnType(TypeCheckError),
 
     /// system_schema.columns has invalid column type.
     #[error("system_schema.columns has invalid column type: {0}")]
-    SchemaColumnsInvalidColumnType(FromRowError),
+    SchemaColumnsInvalidColumnType(TypeCheckError),
 
     /// Unknown column kind.
     #[error("Unknown column kind '{column_kind}' for {keyspace_name}.{table_name}.{column_name}")]
@@ -499,7 +552,7 @@ pub enum TablesMetadataError {
 pub enum ViewsMetadataError {
     /// system_schema.views has invalid column type.
     #[error("system_schema.views has invalid column type: {0}")]
-    SchemaViewsInvalidColumnType(FromRowError),
+    SchemaViewsInvalidColumnType(TypeCheckError),
 }
 
 /// Error caused by caller creating an invalid query

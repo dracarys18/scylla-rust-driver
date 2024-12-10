@@ -72,22 +72,19 @@
 //! # use scylla::Session;
 //! # use std::error::Error;
 //! # async fn check_only_compiles(session: &Session) -> Result<(), Box<dyn Error>> {
-//! use scylla::IntoTypedRows;
 //!
 //! // Read rows containing an int and text
 //! // Keep in mind that all results come in one response (no paging is done!),
 //! // so the memory footprint and latency may be huge!
 //! // To prevent that, use `Session::query_iter` or `Session::query_single_page`.
-//! let rows_opt = session
+//! let query_rows = session
 //!     .query_unpaged("SELECT a, b FROM ks.tab", &[])
 //!     .await?
-//!     .rows;
-//!
-//! if let Some(rows) = rows_opt {
-//!     for row in rows.into_typed::<(i32, String)>() {
-//!         // Parse row as int and text \
-//!         let (int_val, text_val): (i32, String) = row?;
-//!     }
+//!     .into_rows_result()?;
+//!     
+//! for row in query_rows.rows()? {
+//!     // Parse row as int and text \
+//!     let (int_val, text_val): (i32, &str) = row?;
 //! }
 //! # Ok(())
 //! # }
@@ -121,6 +118,9 @@ pub mod frame {
         pub(crate) use scylla_cql::frame::response::*;
 
         pub mod result {
+            #[cfg(cpp_rust_unstable)]
+            pub use scylla_cql::frame::response::result::DeserializedMetadataAndRawRows;
+
             pub(crate) use scylla_cql::frame::response::result::*;
             pub use scylla_cql::frame::response::result::{
                 ColumnSpec, ColumnType, CqlValue, PartitionKeyIndex, Row, TableSpec,
@@ -209,7 +209,7 @@ pub mod deserialize {
 
     /// Deserializing the whole query result contents.
     pub mod result {
-        pub use scylla_cql::types::deserialize::result::{RowIterator, TypedRowIterator};
+        pub use scylla_cql::types::deserialize::result::TypedRowIterator;
     }
 
     /// Deserializing a row of the query result.
@@ -230,6 +230,22 @@ pub mod deserialize {
             UdtIterator, UdtTypeCheckErrorKind,
         };
     }
+
+    // Shorthands for better readability.
+    #[cfg_attr(not(test), allow(unused))]
+    pub(crate) trait DeserializeOwnedValue:
+        for<'frame, 'metadata> DeserializeValue<'frame, 'metadata>
+    {
+    }
+    impl<T> DeserializeOwnedValue for T where
+        T: for<'frame, 'metadata> DeserializeValue<'frame, 'metadata>
+    {
+    }
+    pub(crate) trait DeserializeOwnedRow:
+        for<'frame, 'metadata> DeserializeRow<'frame, 'metadata>
+    {
+    }
+    impl<T> DeserializeOwnedRow for T where T: for<'frame, 'metadata> DeserializeRow<'frame, 'metadata> {}
 }
 
 pub mod authentication;
@@ -244,22 +260,24 @@ pub mod transport;
 
 pub(crate) mod utils;
 
-/// This module is NOT part of the public API (it is `pub` only for internal use of integration tests).
-/// Future minor releases are free to introduce breaking API changes inside it.
-#[doc(hidden)]
-pub use utils::test_utils;
+#[cfg(test)]
+pub(crate) use utils::test_utils;
 
 pub use statement::batch;
 pub use statement::prepared_statement;
 pub use statement::query;
 
-pub use frame::response::cql_to_rust;
-pub use frame::response::cql_to_rust::FromRow;
+#[allow(deprecated)]
+pub use frame::response::cql_to_rust::{self, FromRow};
 
-pub use transport::caching_session::CachingSession;
+#[allow(deprecated)]
+pub use transport::caching_session::{CachingSession, GenericCachingSession, LegacyCachingSession};
 pub use transport::execution_profile::ExecutionProfile;
-pub use transport::query_result::QueryResult;
-pub use transport::session::{IntoTypedRows, Session, SessionConfig};
+#[allow(deprecated)]
+pub use transport::legacy_query_result::LegacyQueryResult;
+pub use transport::query_result::{QueryResult, QueryRowsResult};
+#[allow(deprecated)]
+pub use transport::session::{IntoTypedRows, LegacySession, Session, SessionConfig};
 pub use transport::session_builder::SessionBuilder;
 
 #[cfg(feature = "cloud")]

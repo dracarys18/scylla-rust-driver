@@ -1,10 +1,10 @@
-use crate::utils::{setup_tracing, test_with_3_node_cluster};
+use crate::utils::{setup_tracing, test_with_3_node_cluster, unique_keyspace_name, PerformDDL};
+use scylla::query::Query;
 use scylla::retry_policy::FallthroughRetryPolicy;
 use scylla::speculative_execution::SimpleSpeculativeExecutionPolicy;
 use scylla::transport::session::Session;
 use scylla::ExecutionProfile;
 use scylla::SessionBuilder;
-use scylla::{query::Query, test_utils::unique_keyspace_name};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::info;
@@ -36,10 +36,10 @@ async fn speculative_execution_is_fired() {
             .unwrap();
 
         let ks = unique_keyspace_name();
-        session.query_unpaged(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 3}}", ks), &[]).await.unwrap();
+        session.ddl(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 3}}", ks)).await.unwrap();
         session.use_keyspace(ks, false).await.unwrap();
         session
-            .query_unpaged("CREATE TABLE t (a int primary key)", &[])
+            .ddl("CREATE TABLE t (a int primary key)")
             .await
             .unwrap();
 
@@ -112,10 +112,10 @@ async fn retries_occur() {
             .unwrap();
 
         let ks = unique_keyspace_name();
-        session.query_unpaged(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 3}}", ks), &[]).await.unwrap();
+        session.ddl(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 3}}", ks)).await.unwrap();
         session.use_keyspace(ks, false).await.unwrap();
         session
-            .query_unpaged("CREATE TABLE t (a int primary key)", &[])
+            .ddl("CREATE TABLE t (a int primary key)")
             .await
             .unwrap();
 
@@ -192,10 +192,10 @@ async fn speculative_execution_panic_regression_test() {
             .unwrap();
 
         let ks = unique_keyspace_name();
-        session.query_unpaged(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 3}}", ks), &[]).await.unwrap();
+        session.ddl(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 3}}", ks)).await.unwrap();
         session.use_keyspace(ks, false).await.unwrap();
         session
-            .query_unpaged("CREATE TABLE t (a int primary key)", &[])
+            .ddl("CREATE TABLE t (a int primary key)")
             .await
             .unwrap();
 

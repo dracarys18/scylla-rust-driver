@@ -1,19 +1,18 @@
-use crate as scylla;
-use crate::cql_to_rust::FromCqlVal;
-use crate::frame::response::result::CqlValue;
-use crate::frame::value::{Counter, CqlDate, CqlTime, CqlTimestamp};
-use crate::macros::FromUserType;
-use crate::test_utils::{create_new_session_builder, scylla_supports_tablets, setup_tracing};
-use crate::transport::session::Session;
-use crate::utils::test_utils::unique_keyspace_name;
 use itertools::Itertools;
-use scylla_cql::frame::value::{CqlTimeuuid, CqlVarint};
-use scylla_cql::types::serialize::value::SerializeValue;
-use scylla_macros::SerializeValue;
+use scylla::frame::response::result::CqlValue;
+use scylla::frame::value::{Counter, CqlDate, CqlTime, CqlTimestamp, CqlTimeuuid, CqlVarint};
+use scylla::serialize::value::SerializeValue;
+use scylla::Session;
+use scylla::{DeserializeValue, SerializeValue};
 use std::cmp::PartialEq;
 use std::fmt::Debug;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::str::FromStr;
+
+use crate::utils::{
+    create_new_session_builder, scylla_supports_tablets, setup_tracing, unique_keyspace_name,
+    DeserializeOwnedValue, PerformDDL,
+};
 
 // Used to prepare a table for test
 // Creates a new keyspace, without tablets if requested and the ScyllaDB instance supports them.
@@ -36,22 +35,19 @@ async fn init_test_maybe_without_tablets(
         create_ks += " AND TABLETS = {'enabled': false}"
     }
 
-    session.query_unpaged(create_ks, &[]).await.unwrap();
+    session.ddl(create_ks).await.unwrap();
     session.use_keyspace(ks, false).await.unwrap();
 
     session
-        .query_unpaged(format!("DROP TABLE IF EXISTS {}", table_name), &[])
+        .ddl(format!("DROP TABLE IF EXISTS {}", table_name))
         .await
         .unwrap();
 
     session
-        .query_unpaged(
-            format!(
-                "CREATE TABLE IF NOT EXISTS {} (id int PRIMARY KEY, val {})",
-                table_name, type_name
-            ),
-            &[],
-        )
+        .ddl(format!(
+            "CREATE TABLE IF NOT EXISTS {} (id int PRIMARY KEY, val {})",
+            table_name, type_name
+        ))
         .await
         .unwrap();
 
@@ -75,7 +71,7 @@ async fn init_test(table_name: &str, type_name: &str) -> Session {
 // Expected values and bound values are computed using T::from_str
 async fn run_tests<T>(tests: &[&str], type_name: &str)
 where
-    T: SerializeValue + FromCqlVal<CqlValue> + FromStr + Debug + Clone + PartialEq,
+    T: SerializeValue + DeserializeOwnedValue + FromStr + Debug + Clone + PartialEq,
 {
     let session: Session = init_test(type_name, type_name).await;
     session.await_schema_agreement().await.unwrap();
@@ -100,7 +96,9 @@ where
             .query_unpaged(select_values, &[])
             .await
             .unwrap()
-            .rows_typed::<(T,)>()
+            .into_rows_result()
+            .unwrap()
+            .rows::<(T,)>()
             .unwrap()
             .map(Result::unwrap)
             .map(|row| row.0)
@@ -172,26 +170,20 @@ async fn test_cql_varint() {
     let ks = unique_keyspace_name();
 
     session
-        .query_unpaged(
-            format!(
-                "CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = \
+        .ddl(format!(
+            "CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = \
             {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}",
-                ks
-            ),
-            &[],
-        )
+            ks
+        ))
         .await
         .unwrap();
     session.use_keyspace(ks, false).await.unwrap();
 
     session
-        .query_unpaged(
-            format!(
-                "CREATE TABLE IF NOT EXISTS {} (id int PRIMARY KEY, val varint)",
-                table_name
-            ),
-            &[],
-        )
+        .ddl(format!(
+            "CREATE TABLE IF NOT EXISTS {} (id int PRIMARY KEY, val varint)",
+            table_name
+        ))
         .await
         .unwrap();
 
@@ -218,7 +210,9 @@ async fn test_cql_varint() {
             .execute_unpaged(&prepared_select, &[])
             .await
             .unwrap()
-            .rows_typed::<(CqlVarint,)>()
+            .into_rows_result()
+            .unwrap()
+            .rows::<(CqlVarint,)>()
             .unwrap()
             .map(Result::unwrap)
             .map(|row| row.0)
@@ -293,7 +287,9 @@ async fn test_counter() {
             .query_unpaged(select_values, (i as i32,))
             .await
             .unwrap()
-            .rows_typed::<(Counter,)>()
+            .into_rows_result()
+            .unwrap()
+            .rows::<(Counter,)>()
             .unwrap()
             .map(Result::unwrap)
             .map(|row| row.0)
@@ -369,7 +365,9 @@ async fn test_naive_date_04() {
             .query_unpaged("SELECT val from chrono_naive_date_tests", &[])
             .await
             .unwrap()
-            .rows_typed::<(NaiveDate,)>()
+            .into_rows_result()
+            .unwrap()
+            .rows::<(NaiveDate,)>()
             .unwrap()
             .next()
             .unwrap()
@@ -392,7 +390,9 @@ async fn test_naive_date_04() {
                 .query_unpaged("SELECT val from chrono_naive_date_tests", &[])
                 .await
                 .unwrap()
-                .single_row_typed::<(NaiveDate,)>()
+                .into_rows_result()
+                .unwrap()
+                .single_row::<(NaiveDate,)>()
                 .unwrap();
             assert_eq!(read_date, *naive_date);
         }
@@ -427,15 +427,13 @@ async fn test_cql_date() {
             .await
             .unwrap();
 
-        let read_date: CqlDate = session
+        let (read_date,): (CqlDate,) = session
             .query_unpaged("SELECT val from cql_date_tests", &[])
             .await
             .unwrap()
-            .rows
-            .unwrap()[0]
-            .columns[0]
-            .as_ref()
-            .map(|cql_val| cql_val.as_cql_date().unwrap())
+            .into_rows_result()
+            .unwrap()
+            .single_row::<(CqlDate,)>()
             .unwrap();
 
         assert_eq!(read_date, *date);
@@ -518,7 +516,9 @@ async fn test_date_03() {
             .query_unpaged("SELECT val from time_date_tests", &[])
             .await
             .unwrap()
-            .first_row_typed::<(Date,)>()
+            .into_rows_result()
+            .unwrap()
+            .first_row::<(Date,)>()
             .ok()
             .map(|val| val.0);
 
@@ -538,7 +538,9 @@ async fn test_date_03() {
                 .query_unpaged("SELECT val from time_date_tests", &[])
                 .await
                 .unwrap()
-                .first_row_typed::<(Date,)>()
+                .into_rows_result()
+                .unwrap()
+                .first_row::<(Date,)>()
                 .unwrap();
             assert_eq!(read_date, *date);
         }
@@ -581,7 +583,9 @@ async fn test_cql_time() {
             .query_unpaged("SELECT val from cql_time_tests", &[])
             .await
             .unwrap()
-            .single_row_typed::<(CqlTime,)>()
+            .into_rows_result()
+            .unwrap()
+            .single_row::<(CqlTime,)>()
             .unwrap();
 
         assert_eq!(read_time, *time_duration);
@@ -599,7 +603,9 @@ async fn test_cql_time() {
             .query_unpaged("SELECT val from cql_time_tests", &[])
             .await
             .unwrap()
-            .single_row_typed::<(CqlTime,)>()
+            .into_rows_result()
+            .unwrap()
+            .single_row::<(CqlTime,)>()
             .unwrap();
 
         assert_eq!(read_time, *time_duration);
@@ -677,7 +683,9 @@ async fn test_naive_time_04() {
             .query_unpaged("SELECT val from chrono_time_tests", &[])
             .await
             .unwrap()
-            .first_row_typed::<(NaiveTime,)>()
+            .into_rows_result()
+            .unwrap()
+            .first_row::<(NaiveTime,)>()
             .unwrap();
 
         assert_eq!(read_time, *time);
@@ -695,7 +703,9 @@ async fn test_naive_time_04() {
             .query_unpaged("SELECT val from chrono_time_tests", &[])
             .await
             .unwrap()
-            .first_row_typed::<(NaiveTime,)>()
+            .into_rows_result()
+            .unwrap()
+            .first_row::<(NaiveTime,)>()
             .unwrap();
         assert_eq!(read_time, *time);
     }
@@ -757,7 +767,9 @@ async fn test_time_03() {
             .query_unpaged("SELECT val from time_time_tests", &[])
             .await
             .unwrap()
-            .first_row_typed::<(Time,)>()
+            .into_rows_result()
+            .unwrap()
+            .first_row::<(Time,)>()
             .unwrap();
 
         assert_eq!(read_time, *time);
@@ -775,7 +787,9 @@ async fn test_time_03() {
             .query_unpaged("SELECT val from time_time_tests", &[])
             .await
             .unwrap()
-            .first_row_typed::<(Time,)>()
+            .into_rows_result()
+            .unwrap()
+            .first_row::<(Time,)>()
             .unwrap();
         assert_eq!(read_time, *time);
     }
@@ -828,7 +842,9 @@ async fn test_cql_timestamp() {
             .query_unpaged("SELECT val from cql_timestamp_tests", &[])
             .await
             .unwrap()
-            .single_row_typed::<(CqlTimestamp,)>()
+            .into_rows_result()
+            .unwrap()
+            .single_row::<(CqlTimestamp,)>()
             .unwrap();
 
         assert_eq!(read_timestamp, *timestamp_duration);
@@ -846,7 +862,9 @@ async fn test_cql_timestamp() {
             .query_unpaged("SELECT val from cql_timestamp_tests", &[])
             .await
             .unwrap()
-            .single_row_typed::<(CqlTimestamp,)>()
+            .into_rows_result()
+            .unwrap()
+            .single_row::<(CqlTimestamp,)>()
             .unwrap();
 
         assert_eq!(read_timestamp, *timestamp_duration);
@@ -923,7 +941,9 @@ async fn test_date_time_04() {
             .query_unpaged("SELECT val from chrono_datetime_tests", &[])
             .await
             .unwrap()
-            .first_row_typed::<(DateTime<Utc>,)>()
+            .into_rows_result()
+            .unwrap()
+            .first_row::<(DateTime<Utc>,)>()
             .unwrap();
 
         assert_eq!(read_datetime, *datetime);
@@ -941,7 +961,9 @@ async fn test_date_time_04() {
             .query_unpaged("SELECT val from chrono_datetime_tests", &[])
             .await
             .unwrap()
-            .first_row_typed::<(DateTime<Utc>,)>()
+            .into_rows_result()
+            .unwrap()
+            .first_row::<(DateTime<Utc>,)>()
             .unwrap();
         assert_eq!(read_datetime, *datetime);
     }
@@ -969,7 +991,9 @@ async fn test_date_time_04() {
         .query_unpaged("SELECT val from chrono_datetime_tests", &[])
         .await
         .unwrap()
-        .first_row_typed::<(DateTime<Utc>,)>()
+        .into_rows_result()
+        .unwrap()
+        .first_row::<(DateTime<Utc>,)>()
         .unwrap();
     assert_eq!(read_datetime, nanosecond_precision_1st_half_rounded);
 
@@ -995,7 +1019,9 @@ async fn test_date_time_04() {
         .query_unpaged("SELECT val from chrono_datetime_tests", &[])
         .await
         .unwrap()
-        .first_row_typed::<(DateTime<Utc>,)>()
+        .into_rows_result()
+        .unwrap()
+        .first_row::<(DateTime<Utc>,)>()
         .unwrap();
     assert_eq!(read_datetime, nanosecond_precision_2nd_half_rounded);
 
@@ -1084,7 +1110,9 @@ async fn test_offset_date_time_03() {
             .query_unpaged("SELECT val from time_datetime_tests", &[])
             .await
             .unwrap()
-            .first_row_typed::<(OffsetDateTime,)>()
+            .into_rows_result()
+            .unwrap()
+            .first_row::<(OffsetDateTime,)>()
             .unwrap();
 
         assert_eq!(read_datetime, *datetime);
@@ -1102,7 +1130,9 @@ async fn test_offset_date_time_03() {
             .query_unpaged("SELECT val from time_datetime_tests", &[])
             .await
             .unwrap()
-            .first_row_typed::<(OffsetDateTime,)>()
+            .into_rows_result()
+            .unwrap()
+            .first_row::<(OffsetDateTime,)>()
             .unwrap();
         assert_eq!(read_datetime, *datetime);
     }
@@ -1130,7 +1160,9 @@ async fn test_offset_date_time_03() {
         .query_unpaged("SELECT val from time_datetime_tests", &[])
         .await
         .unwrap()
-        .first_row_typed::<(OffsetDateTime,)>()
+        .into_rows_result()
+        .unwrap()
+        .first_row::<(OffsetDateTime,)>()
         .unwrap();
     assert_eq!(read_datetime, nanosecond_precision_1st_half_rounded);
 
@@ -1156,7 +1188,9 @@ async fn test_offset_date_time_03() {
         .query_unpaged("SELECT val from time_datetime_tests", &[])
         .await
         .unwrap()
-        .first_row_typed::<(OffsetDateTime,)>()
+        .into_rows_result()
+        .unwrap()
+        .first_row::<(OffsetDateTime,)>()
         .unwrap();
     assert_eq!(read_datetime, nanosecond_precision_2nd_half_rounded);
 }
@@ -1205,7 +1239,9 @@ async fn test_timeuuid() {
             .query_unpaged("SELECT val from timeuuid_tests", &[])
             .await
             .unwrap()
-            .single_row_typed::<(CqlTimeuuid,)>()
+            .into_rows_result()
+            .unwrap()
+            .single_row::<(CqlTimeuuid,)>()
             .unwrap();
 
         assert_eq!(read_timeuuid.as_bytes(), timeuuid_bytes);
@@ -1224,7 +1260,9 @@ async fn test_timeuuid() {
             .query_unpaged("SELECT val from timeuuid_tests", &[])
             .await
             .unwrap()
-            .single_row_typed::<(CqlTimeuuid,)>()
+            .into_rows_result()
+            .unwrap()
+            .single_row::<(CqlTimeuuid,)>()
             .unwrap();
 
         assert_eq!(read_timeuuid.as_bytes(), timeuuid_bytes);
@@ -1238,23 +1276,17 @@ async fn test_timeuuid_ordering() {
     let ks = unique_keyspace_name();
 
     session
-        .query_unpaged(
-            format!(
-                "CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = \
+        .ddl(format!(
+            "CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = \
             {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}",
-                ks
-            ),
-            &[],
-        )
+            ks
+        ))
         .await
         .unwrap();
     session.use_keyspace(ks, false).await.unwrap();
 
     session
-        .query_unpaged(
-            "CREATE TABLE tab (p int, t timeuuid, PRIMARY KEY (p, t))",
-            (),
-        )
+        .ddl("CREATE TABLE tab (p int, t timeuuid, PRIMARY KEY (p, t))")
         .await
         .unwrap();
 
@@ -1293,7 +1325,9 @@ async fn test_timeuuid_ordering() {
         .query_unpaged("SELECT t FROM tab WHERE p = 0", ())
         .await
         .unwrap()
-        .rows_typed::<(CqlTimeuuid,)>()
+        .into_rows_result()
+        .unwrap()
+        .rows::<(CqlTimeuuid,)>()
         .unwrap()
         .map(|r| r.unwrap().0)
         .collect();
@@ -1372,7 +1406,9 @@ async fn test_inet() {
             .query_unpaged("SELECT val from inet_tests WHERE id = 0", &[])
             .await
             .unwrap()
-            .single_row_typed::<(IpAddr,)>()
+            .into_rows_result()
+            .unwrap()
+            .single_row::<(IpAddr,)>()
             .unwrap();
 
         assert_eq!(read_inet, *inet);
@@ -1387,7 +1423,9 @@ async fn test_inet() {
             .query_unpaged("SELECT val from inet_tests WHERE id = 0", &[])
             .await
             .unwrap()
-            .single_row_typed::<(IpAddr,)>()
+            .into_rows_result()
+            .unwrap()
+            .single_row::<(IpAddr,)>()
             .unwrap();
 
         assert_eq!(read_inet, *inet);
@@ -1438,7 +1476,9 @@ async fn test_blob() {
             .query_unpaged("SELECT val from blob_tests WHERE id = 0", &[])
             .await
             .unwrap()
-            .single_row_typed::<(Vec<u8>,)>()
+            .into_rows_result()
+            .unwrap()
+            .single_row::<(Vec<u8>,)>()
             .unwrap();
 
         assert_eq!(read_blob, *blob);
@@ -1453,7 +1493,9 @@ async fn test_blob() {
             .query_unpaged("SELECT val from blob_tests WHERE id = 0", &[])
             .await
             .unwrap()
-            .single_row_typed::<(Vec<u8>,)>()
+            .into_rows_result()
+            .unwrap()
+            .single_row::<(Vec<u8>,)>()
             .unwrap();
 
         assert_eq!(read_blob, *blob);
@@ -1470,52 +1512,42 @@ async fn test_udt_after_schema_update() {
     let ks = unique_keyspace_name();
 
     session
-        .query_unpaged(
-            format!(
-                "CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = \
+        .ddl(format!(
+            "CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = \
             {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}",
-                ks
-            ),
-            &[],
-        )
+            ks
+        ))
         .await
         .unwrap();
     session.use_keyspace(ks, false).await.unwrap();
 
     session
-        .query_unpaged(format!("DROP TABLE IF EXISTS {}", table_name), &[])
+        .ddl(format!("DROP TABLE IF EXISTS {}", table_name))
         .await
         .unwrap();
 
     session
-        .query_unpaged(format!("DROP TYPE IF EXISTS {}", type_name), &[])
+        .ddl(format!("DROP TYPE IF EXISTS {}", type_name))
         .await
         .unwrap();
 
     session
-        .query_unpaged(
-            format!(
-                "CREATE TYPE IF NOT EXISTS {} (first int, second boolean)",
-                type_name
-            ),
-            &[],
-        )
+        .ddl(format!(
+            "CREATE TYPE IF NOT EXISTS {} (first int, second boolean)",
+            type_name
+        ))
         .await
         .unwrap();
 
     session
-        .query_unpaged(
-            format!(
-                "CREATE TABLE IF NOT EXISTS {} (id int PRIMARY KEY, val {})",
-                table_name, type_name
-            ),
-            &[],
-        )
+        .ddl(format!(
+            "CREATE TABLE IF NOT EXISTS {} (id int PRIMARY KEY, val {})",
+            table_name, type_name
+        ))
         .await
         .unwrap();
 
-    #[derive(SerializeValue, FromUserType, Debug, PartialEq)]
-    #[scylla(crate = crate)]
+    #[derive(SerializeValue, DeserializeValue, Debug, PartialEq)]
     struct UdtV1 {
         first: i32,
         second: bool,
@@ -1541,7 +1573,9 @@ async fn test_udt_after_schema_update() {
         .query_unpaged(format!("SELECT val from {} WHERE id = 0", table_name), &[])
         .await
         .unwrap()
-        .single_row_typed::<(UdtV1,)>()
+        .into_rows_result()
+        .unwrap()
+        .single_row::<(UdtV1,)>()
         .unwrap();
 
     assert_eq!(read_udt, v1);
@@ -1558,17 +1592,19 @@ async fn test_udt_after_schema_update() {
         .query_unpaged(format!("SELECT val from {} WHERE id = 0", table_name), &[])
         .await
         .unwrap()
-        .single_row_typed::<(UdtV1,)>()
+        .into_rows_result()
+        .unwrap()
+        .single_row::<(UdtV1,)>()
         .unwrap();
 
     assert_eq!(read_udt, v1);
 
     session
-        .query_unpaged(format!("ALTER TYPE {} ADD third text;", type_name), &[])
+        .ddl(format!("ALTER TYPE {} ADD third text;", type_name))
         .await
         .unwrap();
 
-    #[derive(FromUserType, Debug, PartialEq)]
+    #[derive(DeserializeValue, Debug, PartialEq)]
     struct UdtV2 {
         first: i32,
         second: bool,
@@ -1579,7 +1615,9 @@ async fn test_udt_after_schema_update() {
         .query_unpaged(format!("SELECT val from {} WHERE id = 0", table_name), &[])
         .await
         .unwrap()
-        .single_row_typed::<(UdtV2,)>()
+        .into_rows_result()
+        .unwrap()
+        .single_row::<(UdtV2,)>()
         .unwrap();
 
     assert_eq!(
@@ -1609,7 +1647,9 @@ async fn test_empty() {
         .query_unpaged("SELECT val FROM empty_tests WHERE id = 0", ())
         .await
         .unwrap()
-        .first_row_typed::<(CqlValue,)>()
+        .into_rows_result()
+        .unwrap()
+        .first_row::<(CqlValue,)>()
         .unwrap();
 
     assert_eq!(empty, CqlValue::Empty);
@@ -1626,7 +1666,9 @@ async fn test_empty() {
         .query_unpaged("SELECT val FROM empty_tests WHERE id = 1", ())
         .await
         .unwrap()
-        .first_row_typed::<(CqlValue,)>()
+        .into_rows_result()
+        .unwrap()
+        .first_row::<(CqlValue,)>()
         .unwrap();
 
     assert_eq!(empty, CqlValue::Empty);
@@ -1642,47 +1684,38 @@ async fn test_udt_with_missing_field() {
     let ks = unique_keyspace_name();
 
     session
-        .query_unpaged(
-            format!(
-                "CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = \
+        .ddl(format!(
+            "CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = \
             {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}",
-                ks
-            ),
-            &[],
-        )
+            ks
+        ))
         .await
         .unwrap();
     session.use_keyspace(ks, false).await.unwrap();
 
     session
-        .query_unpaged(format!("DROP TABLE IF EXISTS {}", table_name), &[])
+        .ddl(format!("DROP TABLE IF EXISTS {}", table_name))
         .await
         .unwrap();
 
     session
-        .query_unpaged(format!("DROP TYPE IF EXISTS {}", type_name), &[])
+        .ddl(format!("DROP TYPE IF EXISTS {}", type_name))
         .await
         .unwrap();
 
     session
-        .query_unpaged(
-            format!(
-                "CREATE TYPE IF NOT EXISTS {} (first int, second boolean, third float, fourth blob)",
-                type_name
-            ),
-            &[],
-        )
+        .ddl(format!(
+            "CREATE TYPE IF NOT EXISTS {} (first int, second boolean, third float, fourth blob)",
+            type_name
+        ))
         .await
         .unwrap();
 
     session
-        .query_unpaged(
-            format!(
-                "CREATE TABLE IF NOT EXISTS {} (id int PRIMARY KEY, val {})",
-                table_name, type_name
-            ),
-            &[],
-        )
+        .ddl(format!(
+            "CREATE TABLE IF NOT EXISTS {} (id int PRIMARY KEY, val {})",
+            table_name, type_name
+        ))
         .await
         .unwrap();
 
@@ -1696,7 +1729,7 @@ async fn test_udt_with_missing_field() {
         expected: TR,
     ) where
         TQ: SerializeValue,
-        TR: FromCqlVal<CqlValue> + PartialEq + Debug,
+        TR: DeserializeOwnedValue + PartialEq + Debug,
     {
         session
             .query_unpaged(
@@ -1712,13 +1745,15 @@ async fn test_udt_with_missing_field() {
             )
             .await
             .unwrap()
-            .single_row_typed::<(TR,)>()
+            .into_rows_result()
+            .unwrap()
+            .single_row::<(TR,)>()
             .unwrap()
             .0;
         assert_eq!(expected, result);
     }
 
-    #[derive(FromUserType, Debug, PartialEq)]
+    #[derive(DeserializeValue, Debug, PartialEq)]
     struct UdtFull {
         first: i32,
         second: bool,
@@ -1727,7 +1762,6 @@ async fn test_udt_with_missing_field() {
     }
 
     #[derive(SerializeValue)]
-    #[scylla(crate = crate)]
     struct UdtV1 {
         first: i32,
         second: bool,
@@ -1753,7 +1787,6 @@ async fn test_udt_with_missing_field() {
     id += 1;
 
     #[derive(SerializeValue)]
-    #[scylla(crate = crate)]
     struct UdtV2 {
         first: i32,
         second: bool,
@@ -1781,7 +1814,6 @@ async fn test_udt_with_missing_field() {
     id += 1;
 
     #[derive(SerializeValue)]
-    #[scylla(crate = crate)]
     struct UdtV3 {
         first: i32,
         second: bool,
@@ -1809,7 +1841,7 @@ async fn test_udt_with_missing_field() {
     id += 1;
 
     #[derive(SerializeValue)]
-    #[scylla(crate = crate, flavor="enforce_order")]
+    #[scylla(flavor = "enforce_order")]
     struct UdtV4 {
         first: i32,
         second: bool,

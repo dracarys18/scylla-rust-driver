@@ -1,7 +1,12 @@
-#[cfg(test)]
+use crate::load_balancing::{FallbackPlan, LoadBalancingPolicy, RoutingInfo};
+use crate::query::Query;
+use crate::routing::Shard;
+use crate::transport::connection::Connection;
+use crate::transport::errors::QueryError;
 use crate::transport::session_builder::{GenericSessionBuilder, SessionBuilderKind};
-use crate::Session;
-#[cfg(test)]
+use crate::transport::{ClusterData, NodeRef};
+use crate::{CachingSession, ExecutionProfile, Session};
+use std::sync::Arc;
 use std::{num::NonZeroU32, time::Duration};
 use std::{
     sync::atomic::{AtomicUsize, Ordering},
@@ -10,7 +15,7 @@ use std::{
 
 static UNIQUE_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
-pub fn unique_keyspace_name() -> String {
+pub(crate) fn unique_keyspace_name() -> String {
     let cnt = UNIQUE_COUNTER.fetch_add(1, Ordering::SeqCst);
     let name = format!(
         "test_rust_{}_{}",
@@ -24,7 +29,6 @@ pub fn unique_keyspace_name() -> String {
     name
 }
 
-#[cfg(test)]
 pub(crate) async fn supports_feature(session: &Session, feature: &str) -> bool {
     // Cassandra doesn't have a concept of features, so first detect
     // if there is the `supported_features` column in system.local
@@ -42,12 +46,14 @@ pub(crate) async fn supports_feature(session: &Session, feature: &str) -> bool {
         return false;
     }
 
-    let (features,): (Option<String>,) = session
+    let result = session
         .query_unpaged("SELECT supported_features FROM system.local", ())
         .await
         .unwrap()
-        .single_row_typed()
+        .into_rows_result()
         .unwrap();
+
+    let (features,): (Option<&str>,) = result.single_row().unwrap();
 
     features
         .unwrap_or_default()
@@ -58,8 +64,7 @@ pub(crate) async fn supports_feature(session: &Session, feature: &str) -> bool {
 // Creates a generic session builder based on conditional compilation configuration
 // For SessionBuilder of DefaultMode type, adds localhost to known hosts, as all of the tests
 // connect to localhost.
-#[cfg(test)]
-pub fn create_new_session_builder() -> GenericSessionBuilder<impl SessionBuilderKind> {
+pub(crate) fn create_new_session_builder() -> GenericSessionBuilder<impl SessionBuilderKind> {
     let session_builder = {
         #[cfg(not(scylla_cloud_tests))]
         {
@@ -92,24 +97,90 @@ pub fn create_new_session_builder() -> GenericSessionBuilder<impl SessionBuilder
         .tracing_info_fetch_interval(Duration::from_millis(50))
 }
 
-pub async fn scylla_supports_tablets(session: &Session) -> bool {
-    let result = session
-        .query_unpaged(
-            "select column_name from system_schema.columns where 
-                keyspace_name = 'system_schema'
-                and table_name = 'scylla_keyspaces'
-                and column_name = 'initial_tablets'",
-            &[],
-        )
-        .await
-        .unwrap();
-    result.single_row().is_ok()
+pub(crate) async fn scylla_supports_tablets(session: &Session) -> bool {
+    supports_feature(session, "TABLETS").await
 }
 
-#[cfg(test)]
 pub(crate) fn setup_tracing() {
     let _ = tracing_subscriber::fmt::fmt()
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .with_writer(tracing_subscriber::fmt::TestWriter::new())
         .try_init();
+}
+
+// This LBP produces a predictable query plan - it order the nodes
+// by position in the ring.
+// This is to make sure that all DDL queries land on the same node,
+// to prevent errors from concurrent DDL queries executed on different nodes.
+#[derive(Debug)]
+struct SchemaQueriesLBP;
+
+impl LoadBalancingPolicy for SchemaQueriesLBP {
+    fn pick<'a>(
+        &'a self,
+        _query: &'a RoutingInfo,
+        cluster: &'a ClusterData,
+    ) -> Option<(NodeRef<'a>, Option<Shard>)> {
+        // I'm not sure if Scylla can handle concurrent DDL queries to different shard,
+        // in other words if its local lock is per-node or per shard.
+        // Just to be safe, let's use explicit shard.
+        cluster.get_nodes_info().first().map(|node| (node, Some(0)))
+    }
+
+    fn fallback<'a>(
+        &'a self,
+        _query: &'a RoutingInfo,
+        cluster: &'a ClusterData,
+    ) -> FallbackPlan<'a> {
+        Box::new(cluster.get_nodes_info().iter().map(|node| (node, Some(0))))
+    }
+
+    fn name(&self) -> String {
+        "SchemaQueriesLBP".to_owned()
+    }
+}
+
+fn apply_ddl_lbp(query: &mut Query) {
+    let policy = query
+        .get_execution_profile_handle()
+        .map(|profile| profile.pointee_to_builder())
+        .unwrap_or(ExecutionProfile::builder())
+        .load_balancing_policy(Arc::new(SchemaQueriesLBP))
+        .build();
+    query.set_execution_profile_handle(Some(policy.into_handle()));
+}
+
+// This is just to make it easier to call the above function:
+// we'll be able to do session.ddl(...) instead of perform_ddl(&session, ...)
+// or something like that.
+#[async_trait::async_trait]
+pub(crate) trait PerformDDL {
+    async fn ddl(&self, query: impl Into<Query> + Send) -> Result<(), QueryError>;
+}
+
+#[async_trait::async_trait]
+impl PerformDDL for Session {
+    async fn ddl(&self, query: impl Into<Query> + Send) -> Result<(), QueryError> {
+        let mut query = query.into();
+        apply_ddl_lbp(&mut query);
+        self.query_unpaged(query, &[]).await.map(|_| ())
+    }
+}
+
+#[async_trait::async_trait]
+impl PerformDDL for CachingSession {
+    async fn ddl(&self, query: impl Into<Query> + Send) -> Result<(), QueryError> {
+        let mut query = query.into();
+        apply_ddl_lbp(&mut query);
+        self.execute_unpaged(query, &[]).await.map(|_| ())
+    }
+}
+
+#[async_trait::async_trait]
+impl PerformDDL for Connection {
+    async fn ddl(&self, query: impl Into<Query> + Send) -> Result<(), QueryError> {
+        let mut query = query.into();
+        apply_ddl_lbp(&mut query);
+        self.query_unpaged(query).await.map(|_| ())
+    }
 }

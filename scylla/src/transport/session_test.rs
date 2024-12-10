@@ -1,41 +1,43 @@
-use crate as scylla;
 use crate::batch::{Batch, BatchStatement};
-use crate::frame::response::result::Row;
+use crate::deserialize::DeserializeOwnedValue;
 use crate::prepared_statement::PreparedStatement;
 use crate::query::Query;
 use crate::retry_policy::{QueryInfo, RetryDecision, RetryPolicy, RetrySession};
 use crate::routing::Token;
 use crate::statement::Consistency;
-use crate::test_utils::{scylla_supports_tablets, setup_tracing};
 use crate::tracing::TracingInfo;
 use crate::transport::errors::{BadKeyspaceName, BadQuery, DbError, QueryError};
 use crate::transport::partitioner::{
     calculate_token_for_partition_key, Murmur3Partitioner, Partitioner, PartitionerName,
 };
+use crate::transport::session::Session;
 use crate::transport::topology::Strategy::NetworkTopologyStrategy;
 use crate::transport::topology::{
     CollectionType, ColumnKind, CqlType, NativeType, UserDefinedType,
 };
 use crate::utils::test_utils::{
-    create_new_session_builder, supports_feature, unique_keyspace_name,
+    create_new_session_builder, scylla_supports_tablets, setup_tracing, supports_feature,
+    unique_keyspace_name, PerformDDL,
 };
-use crate::CachingSession;
 use crate::ExecutionProfile;
-use crate::QueryResult;
-use crate::{Session, SessionBuilder};
+use crate::{self as scylla, QueryResult};
+use crate::{CachingSession, SessionBuilder};
 use assert_matches::assert_matches;
-use futures::{FutureExt, StreamExt, TryStreamExt};
+use futures::{FutureExt, StreamExt as _, TryStreamExt};
 use itertools::Itertools;
 use scylla_cql::frame::request::query::{PagingState, PagingStateResponse};
-use scylla_cql::frame::response::result::ColumnType;
+use scylla_cql::frame::response::result::{ColumnType, Row};
+use scylla_cql::frame::value::CqlVarint;
 use scylla_cql::types::serialize::row::{SerializeRow, SerializedValues};
 use scylla_cql::types::serialize::value::SerializeValue;
-use std::collections::BTreeSet;
 use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeSet, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::net::TcpListener;
 use uuid::Uuid;
+
+use super::query_result::QueryRowsResult;
 
 #[tokio::test]
 async fn test_connection_failure() {
@@ -68,15 +70,12 @@ async fn test_unprepared_statement() {
     let session = create_new_session_builder().build().await.unwrap();
     let ks = unique_keyspace_name();
 
-    session.query_unpaged(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks), &[]).await.unwrap();
+    session.ddl(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks)).await.unwrap();
     session
-        .query_unpaged(
-            format!(
-                "CREATE TABLE IF NOT EXISTS {}.t (a int, b int, c text, primary key (a, b))",
-                ks
-            ),
-            &[],
-        )
+        .ddl(format!(
+            "CREATE TABLE IF NOT EXISTS {}.t (a int, b int, c text, primary key (a, b))",
+            ks
+        ))
         .await
         .unwrap();
 
@@ -107,42 +106,40 @@ async fn test_unprepared_statement() {
         .await
         .unwrap();
 
-    let (a_idx, _) = query_result.get_column_spec("a").unwrap();
-    let (b_idx, _) = query_result.get_column_spec("b").unwrap();
-    let (c_idx, _) = query_result.get_column_spec("c").unwrap();
-    assert!(query_result.get_column_spec("d").is_none());
+    let rows = query_result.into_rows_result().unwrap();
 
-    let rs = query_result.rows.unwrap();
+    let col_specs = rows.column_specs();
+    assert_eq!(col_specs.get_by_name("a").unwrap().0, 0);
+    assert_eq!(col_specs.get_by_name("b").unwrap().0, 1);
+    assert_eq!(col_specs.get_by_name("c").unwrap().0, 2);
+    assert!(col_specs.get_by_name("d").is_none());
 
-    let mut results: Vec<(i32, i32, &String)> = rs
-        .iter()
-        .map(|r| {
-            let a = r.columns[a_idx].as_ref().unwrap().as_int().unwrap();
-            let b = r.columns[b_idx].as_ref().unwrap().as_int().unwrap();
-            let c = r.columns[c_idx].as_ref().unwrap().as_text().unwrap();
-            (a, b, c)
-        })
-        .collect();
+    let mut results = rows
+        .rows::<(i32, i32, String)>()
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+
     results.sort();
     assert_eq!(
         results,
         vec![
-            (1, 2, &String::from("abc")),
-            (1, 4, &String::from("hello")),
-            (7, 11, &String::from(""))
+            (1, 2, String::from("abc")),
+            (1, 4, String::from("hello")),
+            (7, 11, String::from(""))
         ]
     );
     let query_result = session
         .query_iter(format!("SELECT a, b, c FROM {}.t", ks), &[])
         .await
         .unwrap();
-    let specs = query_result.get_column_specs();
+    let specs = query_result.column_specs();
     assert_eq!(specs.len(), 3);
     for (spec, name) in specs.iter().zip(["a", "b", "c"]) {
         assert_eq!(spec.name(), name); // Check column name.
         assert_eq!(spec.table_spec().ks_name(), ks);
     }
-    let mut results_from_manual_paging: Vec<Row> = vec![];
+    let mut results_from_manual_paging = vec![];
     let query = Query::new(format!("SELECT a, b, c FROM {}.t", ks)).with_page_size(1);
     let mut paging_state = PagingState::start();
     let mut watchdog = 0;
@@ -151,7 +148,14 @@ async fn test_unprepared_statement() {
             .query_single_page(query.clone(), &[], paging_state)
             .await
             .unwrap();
-        results_from_manual_paging.append(&mut rs_manual.rows.unwrap());
+        let mut page_results = rs_manual
+            .into_rows_result()
+            .unwrap()
+            .rows::<(i32, i32, String)>()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        results_from_manual_paging.append(&mut page_results);
         match paging_state_response {
             PagingStateResponse::HasMorePages { state } => {
                 paging_state = state;
@@ -161,7 +165,7 @@ async fn test_unprepared_statement() {
         }
         watchdog += 1;
     }
-    assert_eq!(results_from_manual_paging, rs);
+    assert_eq!(results_from_manual_paging, results);
 }
 
 #[tokio::test]
@@ -170,19 +174,16 @@ async fn test_prepared_statement() {
     let session = create_new_session_builder().build().await.unwrap();
     let ks = unique_keyspace_name();
 
-    session.query_unpaged(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks), &[]).await.unwrap();
+    session.ddl(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks)).await.unwrap();
     session
-        .query_unpaged(
-            format!(
-                "CREATE TABLE IF NOT EXISTS {}.t2 (a int, b int, c text, primary key (a, b))",
-                ks
-            ),
-            &[],
-        )
+        .ddl(format!(
+            "CREATE TABLE IF NOT EXISTS {}.t2 (a int, b int, c text, primary key (a, b))",
+            ks
+        ))
         .await
         .unwrap();
     session
-        .query_unpaged(format!("CREATE TABLE IF NOT EXISTS {}.complex_pk (a int, b int, c text, d int, e int, primary key ((a,b,c),d))", ks), &[])
+        .ddl(format!("CREATE TABLE IF NOT EXISTS {}.complex_pk (a int, b int, c text, d int, e int, primary key ((a,b,c),d))", ks))
         .await
         .unwrap();
 
@@ -195,7 +196,7 @@ async fn test_prepared_statement() {
         .await
         .unwrap();
     let query_result = session.execute_iter(prepared_statement, &[]).await.unwrap();
-    let specs = query_result.get_column_specs();
+    let specs = query_result.column_specs();
     assert_eq!(specs.len(), 3);
     for (spec, name) in specs.iter().zip(["a", "b", "c"]) {
         assert_eq!(spec.name(), name); // Check column name.
@@ -234,7 +235,9 @@ async fn test_prepared_statement() {
             .query_unpaged(format!("SELECT token(a) FROM {}.t2", ks), &[])
             .await
             .unwrap()
-            .single_row_typed()
+            .into_rows_result()
+            .unwrap()
+            .single_row::<(i64,)>()
             .unwrap();
         let token = Token::new(value);
         let prepared_token = Murmur3Partitioner
@@ -253,7 +256,9 @@ async fn test_prepared_statement() {
             .query_unpaged(format!("SELECT token(a,b,c) FROM {}.complex_pk", ks), &[])
             .await
             .unwrap()
-            .single_row_typed()
+            .into_rows_result()
+            .unwrap()
+            .single_row::<(i64,)>()
             .unwrap();
         let token = Token::new(value);
         let prepared_token = Murmur3Partitioner.hash_one(
@@ -275,15 +280,16 @@ async fn test_prepared_statement() {
             .query_unpaged(format!("SELECT a,b,c FROM {}.t2", ks), &[])
             .await
             .unwrap()
-            .rows
+            .into_rows_result()
+            .unwrap()
+            .rows::<(i32, i32, String)>()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
             .unwrap();
-        let r = rs.first().unwrap();
-        let a = r.columns[0].as_ref().unwrap().as_int().unwrap();
-        let b = r.columns[1].as_ref().unwrap().as_int().unwrap();
-        let c = r.columns[2].as_ref().unwrap().as_text().unwrap();
-        assert_eq!((a, b, c), (17, 16, &String::from("I'm prepared!!!")));
+        let r = &rs[0];
+        assert_eq!(r, &(17, 16, String::from("I'm prepared!!!")));
 
-        let mut results_from_manual_paging: Vec<Row> = vec![];
+        let mut results_from_manual_paging = vec![];
         let query = Query::new(format!("SELECT a, b, c FROM {}.t2", ks)).with_page_size(1);
         let prepared_paged = session.prepare(query).await.unwrap();
         let mut paging_state = PagingState::start();
@@ -293,7 +299,14 @@ async fn test_prepared_statement() {
                 .execute_single_page(&prepared_paged, &[], paging_state)
                 .await
                 .unwrap();
-            results_from_manual_paging.append(&mut rs_manual.rows.unwrap());
+            let mut page_results = rs_manual
+                .into_rows_result()
+                .unwrap()
+                .rows::<(i32, i32, String)>()
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            results_from_manual_paging.append(&mut page_results);
             match paging_state_response {
                 PagingStateResponse::HasMorePages { state } => {
                     paging_state = state;
@@ -310,7 +323,9 @@ async fn test_prepared_statement() {
             .query_unpaged(format!("SELECT a,b,c,d,e FROM {}.complex_pk", ks), &[])
             .await
             .unwrap()
-            .single_row_typed()
+            .into_rows_result()
+            .unwrap()
+            .single_row::<(i32, i32, String, i32, Option<i32>)>()
             .unwrap();
         assert!(e.is_none());
         assert_eq!(
@@ -318,9 +333,9 @@ async fn test_prepared_statement() {
             (17, 16, "I'm prepared!!!", 7, None)
         );
     }
-    // Check that SerializeRow macro works
+    // Check that SerializeRow and DeserializeRow macros work
     {
-        #[derive(scylla::SerializeRow, scylla::FromRow, PartialEq, Debug, Clone)]
+        #[derive(scylla::SerializeRow, scylla::DeserializeRow, PartialEq, Debug, Clone)]
         #[scylla(crate = crate)]
         struct ComplexPk {
             a: i32,
@@ -356,7 +371,9 @@ async fn test_prepared_statement() {
             )
             .await
             .unwrap()
-            .single_row_typed()
+            .into_rows_result()
+            .unwrap()
+            .single_row()
             .unwrap();
         assert_eq!(input, output)
     }
@@ -378,15 +395,12 @@ async fn test_counter_batch() {
         create_ks += " AND TABLETS = {'enabled': false}"
     }
 
-    session.query_unpaged(create_ks, &[]).await.unwrap();
+    session.ddl(create_ks).await.unwrap();
     session
-        .query_unpaged(
-            format!(
-                "CREATE TABLE IF NOT EXISTS {}.t_batch (key int PRIMARY KEY, value counter)",
-                ks
-            ),
-            &[],
-        )
+        .ddl(format!(
+            "CREATE TABLE IF NOT EXISTS {}.t_batch (key int PRIMARY KEY, value counter)",
+            ks
+        ))
         .await
         .unwrap();
 
@@ -426,15 +440,12 @@ async fn test_batch() {
     let session = Arc::new(create_new_session_builder().build().await.unwrap());
     let ks = unique_keyspace_name();
 
-    session.query_unpaged(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks), &[]).await.unwrap();
+    session.ddl(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks)).await.unwrap();
     session
-        .query_unpaged(
-            format!(
-                "CREATE TABLE IF NOT EXISTS {}.t_batch (a int, b int, c text, primary key (a, b))",
-                ks
-            ),
-            &[],
-        )
+        .ddl(format!(
+            "CREATE TABLE IF NOT EXISTS {}.t_batch (a int, b int, c text, primary key (a, b))",
+            ks
+        ))
         .await
         .unwrap();
 
@@ -446,7 +457,7 @@ async fn test_batch() {
         .await
         .unwrap();
 
-    // TODO: Add API, that supports binding values to statements in batch creation process,
+    // TODO: Add API that supports binding values to statements in batch creation process,
     // to avoid problem of statements/values count mismatch
     use crate::batch::Batch;
     let mut batch: Batch = Default::default();
@@ -477,7 +488,9 @@ async fn test_batch() {
         .query_unpaged(format!("SELECT a, b, c FROM {}.t_batch", ks), &[])
         .await
         .unwrap()
-        .rows_typed()
+        .into_rows_result()
+        .unwrap()
+        .rows::<(i32, i32, String)>()
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
@@ -499,10 +512,10 @@ async fn test_batch() {
 
     // This statement flushes the prepared statement cache
     session
-        .query_unpaged(
-            format!("ALTER TABLE {}.t_batch WITH gc_grace_seconds = 42", ks),
-            &[],
-        )
+        .ddl(format!(
+            "ALTER TABLE {}.t_batch WITH gc_grace_seconds = 42",
+            ks
+        ))
         .await
         .unwrap();
     session.batch(&batch, values).await.unwrap();
@@ -514,12 +527,50 @@ async fn test_batch() {
         )
         .await
         .unwrap()
-        .rows_typed()
+        .into_rows_result()
+        .unwrap()
+        .rows::<(i32, i32, String)>()
         .unwrap()
         .collect::<Result<_, _>>()
         .unwrap();
 
     assert_eq!(results, vec![(4, 20, String::from("foobar"))]);
+}
+
+// This is a regression test for #1134.
+#[tokio::test]
+async fn test_batch_to_multiple_tables() {
+    setup_tracing();
+    let session = create_new_session_builder().build().await.unwrap();
+    let ks = unique_keyspace_name();
+
+    session.ddl(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks)).await.unwrap();
+    session.use_keyspace(&ks, true).await.unwrap();
+    session
+        .ddl("CREATE TABLE IF NOT EXISTS t_batch1 (a int, b int, c text, primary key (a, b))")
+        .await
+        .unwrap();
+    session
+        .ddl("CREATE TABLE IF NOT EXISTS t_batch2 (a int, b int, c text, primary key (a, b))")
+        .await
+        .unwrap();
+
+    let prepared_statement = session
+        .prepare(
+            "
+            BEGIN BATCH
+                INSERT INTO t_batch1 (a, b, c) VALUES (?, ?, ?);
+                INSERT INTO t_batch2 (a, b, c) VALUES (?, ?, ?);
+            APPLY BATCH;
+            ",
+        )
+        .await
+        .unwrap();
+
+    session
+        .execute_unpaged(&prepared_statement, (1, 2, "ala", 4, 5, "ma"))
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -528,12 +579,12 @@ async fn test_token_calculation() {
     let session = create_new_session_builder().build().await.unwrap();
     let ks = unique_keyspace_name();
 
-    session.query_unpaged(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks), &[]).await.unwrap();
+    session.ddl(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks)).await.unwrap();
     session
-        .query_unpaged(
-            format!("CREATE TABLE IF NOT EXISTS {}.t3 (a text primary key)", ks),
-            &[],
-        )
+        .ddl(format!(
+            "CREATE TABLE IF NOT EXISTS {}.t3 (a text primary key)",
+            ks
+        ))
         .await
         .unwrap();
 
@@ -567,7 +618,9 @@ async fn test_token_calculation() {
             )
             .await
             .unwrap()
-            .single_row_typed()
+            .into_rows_result()
+            .unwrap()
+            .single_row::<(i64,)>()
             .unwrap();
         let token = Token::new(value);
         let prepared_token = Murmur3Partitioner
@@ -597,12 +650,12 @@ async fn test_token_awareness() {
         create_ks += " AND TABLETS = {'enabled': false}"
     }
 
-    session.query_unpaged(create_ks, &[]).await.unwrap();
+    session.ddl(create_ks).await.unwrap();
     session
-        .query_unpaged(
-            format!("CREATE TABLE IF NOT EXISTS {}.t (a text primary key)", ks),
-            &[],
-        )
+        .ddl(format!(
+            "CREATE TABLE IF NOT EXISTS {}.t (a text primary key)",
+            ks
+        ))
         .await
         .unwrap();
 
@@ -623,7 +676,7 @@ async fn test_token_awareness() {
             .await
             .unwrap();
         let tracing_info = session
-            .get_tracing_info(res.tracing_id.as_ref().unwrap())
+            .get_tracing_info(res.tracing_id().as_ref().unwrap())
             .await
             .unwrap();
 
@@ -635,7 +688,7 @@ async fn test_token_awareness() {
             .execute_iter(prepared_statement.clone(), values)
             .await
             .unwrap();
-        let tracing_id = iter.get_tracing_ids()[0];
+        let tracing_id = iter.tracing_ids()[0];
         let tracing_info = session.get_tracing_info(&tracing_id).await.unwrap();
 
         // Again, verify that only one node was involved
@@ -649,13 +702,13 @@ async fn test_use_keyspace() {
     let session = create_new_session_builder().build().await.unwrap();
     let ks = unique_keyspace_name();
 
-    session.query_unpaged(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks), &[]).await.unwrap();
+    session.ddl(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks)).await.unwrap();
 
     session
-        .query_unpaged(
-            format!("CREATE TABLE IF NOT EXISTS {}.tab (a text primary key)", ks),
-            &[],
-        )
+        .ddl(format!(
+            "CREATE TABLE IF NOT EXISTS {}.tab (a text primary key)",
+            ks
+        ))
         .await
         .unwrap();
 
@@ -675,7 +728,9 @@ async fn test_use_keyspace() {
         .query_unpaged("SELECT * FROM tab", &[])
         .await
         .unwrap()
-        .rows_typed::<(String,)>()
+        .into_rows_result()
+        .unwrap()
+        .rows::<(String,)>()
         .unwrap()
         .map(|res| res.unwrap().0)
         .collect();
@@ -724,7 +779,9 @@ async fn test_use_keyspace() {
         .query_unpaged("SELECT * FROM tab", &[])
         .await
         .unwrap()
-        .rows_typed::<(String,)>()
+        .into_rows_result()
+        .unwrap()
+        .rows::<(String,)>()
         .unwrap()
         .map(|res| res.unwrap().0)
         .collect();
@@ -741,22 +798,22 @@ async fn test_use_keyspace_case_sensitivity() {
     let ks_lower = unique_keyspace_name().to_lowercase();
     let ks_upper = ks_lower.to_uppercase();
 
-    session.query_unpaged(format!("CREATE KEYSPACE IF NOT EXISTS \"{}\" WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks_lower), &[]).await.unwrap();
-    session.query_unpaged(format!("CREATE KEYSPACE IF NOT EXISTS \"{}\" WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks_upper), &[]).await.unwrap();
+    session.ddl(format!("CREATE KEYSPACE IF NOT EXISTS \"{}\" WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks_lower)).await.unwrap();
+    session.ddl(format!("CREATE KEYSPACE IF NOT EXISTS \"{}\" WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks_upper)).await.unwrap();
 
     session
-        .query_unpaged(
-            format!("CREATE TABLE {}.tab (a text primary key)", ks_lower),
-            &[],
-        )
+        .ddl(format!(
+            "CREATE TABLE {}.tab (a text primary key)",
+            ks_lower
+        ))
         .await
         .unwrap();
 
     session
-        .query_unpaged(
-            format!("CREATE TABLE \"{}\".tab (a text primary key)", ks_upper),
-            &[],
-        )
+        .ddl(format!(
+            "CREATE TABLE \"{}\".tab (a text primary key)",
+            ks_upper
+        ))
         .await
         .unwrap();
 
@@ -784,7 +841,9 @@ async fn test_use_keyspace_case_sensitivity() {
         .query_unpaged("SELECT * from tab", &[])
         .await
         .unwrap()
-        .rows_typed::<(String,)>()
+        .into_rows_result()
+        .unwrap()
+        .rows::<(String,)>()
         .unwrap()
         .map(|row| row.unwrap().0)
         .collect();
@@ -799,7 +858,9 @@ async fn test_use_keyspace_case_sensitivity() {
         .query_unpaged("SELECT * from tab", &[])
         .await
         .unwrap()
-        .rows_typed::<(String,)>()
+        .into_rows_result()
+        .unwrap()
+        .rows::<(String,)>()
         .unwrap()
         .map(|row| row.unwrap().0)
         .collect();
@@ -813,13 +874,13 @@ async fn test_raw_use_keyspace() {
     let session = create_new_session_builder().build().await.unwrap();
     let ks = unique_keyspace_name();
 
-    session.query_unpaged(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks), &[]).await.unwrap();
+    session.ddl(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks)).await.unwrap();
 
     session
-        .query_unpaged(
-            format!("CREATE TABLE IF NOT EXISTS {}.tab (a text primary key)", ks),
-            &[],
-        )
+        .ddl(format!(
+            "CREATE TABLE IF NOT EXISTS {}.tab (a text primary key)",
+            ks
+        ))
         .await
         .unwrap();
 
@@ -840,7 +901,9 @@ async fn test_raw_use_keyspace() {
         .query_unpaged("SELECT * FROM tab", &[])
         .await
         .unwrap()
-        .rows_typed::<(String,)>()
+        .into_rows_result()
+        .unwrap()
+        .rows::<(String,)>()
         .unwrap()
         .map(|res| res.unwrap().0)
         .collect();
@@ -889,9 +952,9 @@ async fn test_db_errors() {
     ));
 
     // AlreadyExists when creating a keyspace for the second time
-    session.query_unpaged(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks), &[]).await.unwrap();
+    session.ddl(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks)).await.unwrap();
 
-    let create_keyspace_res = session.query_unpaged(format!("CREATE KEYSPACE {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks), &[]).await;
+    let create_keyspace_res = session.ddl(format!("CREATE KEYSPACE {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks)).await;
     let keyspace_exists_error: DbError = match create_keyspace_res {
         Err(QueryError::DbError(e, _)) => e,
         _ => panic!("Second CREATE KEYSPACE didn't return an error!"),
@@ -907,15 +970,15 @@ async fn test_db_errors() {
 
     // AlreadyExists when creating a table for the second time
     session
-        .query_unpaged(
-            format!("CREATE TABLE IF NOT EXISTS {}.tab (a text primary key)", ks),
-            &[],
-        )
+        .ddl(format!(
+            "CREATE TABLE IF NOT EXISTS {}.tab (a text primary key)",
+            ks
+        ))
         .await
         .unwrap();
 
     let create_table_res = session
-        .query_unpaged(format!("CREATE TABLE {}.tab (a text primary key)", ks), &[])
+        .ddl(format!("CREATE TABLE {}.tab (a text primary key)", ks))
         .await;
     let create_tab_error: DbError = match create_table_res {
         Err(QueryError::DbError(e, _)) => e,
@@ -937,13 +1000,13 @@ async fn test_tracing() {
     let session = create_new_session_builder().build().await.unwrap();
     let ks = unique_keyspace_name();
 
-    session.query_unpaged(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks), &[]).await.unwrap();
+    session.ddl(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks)).await.unwrap();
 
     session
-        .query_unpaged(
-            format!("CREATE TABLE IF NOT EXISTS {}.tab (a text primary key)", ks),
-            &[],
-        )
+        .ddl(format!(
+            "CREATE TABLE IF NOT EXISTS {}.tab (a text primary key)",
+            ks
+        ))
         .await
         .unwrap();
 
@@ -962,17 +1025,17 @@ async fn test_tracing_query(session: &Session, ks: String) {
     let untraced_query_result: QueryResult =
         session.query_unpaged(untraced_query, &[]).await.unwrap();
 
-    assert!(untraced_query_result.tracing_id.is_none());
+    assert!(untraced_query_result.tracing_id().is_none());
 
     // A query with tracing enabled has a tracing uuid in result
     let mut traced_query: Query = Query::new(format!("SELECT * FROM {}.tab", ks));
     traced_query.config.tracing = true;
 
     let traced_query_result: QueryResult = session.query_unpaged(traced_query, &[]).await.unwrap();
-    assert!(traced_query_result.tracing_id.is_some());
+    assert!(traced_query_result.tracing_id().is_some());
 
     // Querying this uuid from tracing table gives some results
-    assert_in_tracing_table(session, traced_query_result.tracing_id.unwrap()).await;
+    assert_in_tracing_table(session, traced_query_result.tracing_id().unwrap()).await;
 }
 
 async fn test_tracing_execute(session: &Session, ks: String) {
@@ -987,7 +1050,7 @@ async fn test_tracing_execute(session: &Session, ks: String) {
         .await
         .unwrap();
 
-    assert!(untraced_prepared_result.tracing_id.is_none());
+    assert!(untraced_prepared_result.tracing_id().is_none());
 
     // Executing a prepared statement with tracing enabled has a tracing uuid in result
     let mut traced_prepared = session
@@ -1001,10 +1064,10 @@ async fn test_tracing_execute(session: &Session, ks: String) {
         .execute_unpaged(&traced_prepared, &[])
         .await
         .unwrap();
-    assert!(traced_prepared_result.tracing_id.is_some());
+    assert!(traced_prepared_result.tracing_id().is_some());
 
     // Querying this uuid from tracing table gives some results
-    assert_in_tracing_table(session, traced_prepared_result.tracing_id.unwrap()).await;
+    assert_in_tracing_table(session, traced_prepared_result.tracing_id().unwrap()).await;
 }
 
 async fn test_tracing_prepare(session: &Session, ks: String) {
@@ -1035,7 +1098,7 @@ async fn test_get_tracing_info(session: &Session, ks: String) {
     traced_query.config.tracing = true;
 
     let traced_query_result: QueryResult = session.query_unpaged(traced_query, &[]).await.unwrap();
-    let tracing_id: Uuid = traced_query_result.tracing_id.unwrap();
+    let tracing_id: Uuid = traced_query_result.tracing_id().unwrap();
 
     // Getting tracing info from session using this uuid works
     let tracing_info: TracingInfo = session.get_tracing_info(&tracing_id).await.unwrap();
@@ -1047,33 +1110,22 @@ async fn test_tracing_query_iter(session: &Session, ks: String) {
     // A query without tracing enabled has no tracing ids
     let untraced_query: Query = Query::new(format!("SELECT * FROM {}.tab", ks));
 
-    let mut untraced_row_iter = session.query_iter(untraced_query, &[]).await.unwrap();
-    while let Some(_row) = untraced_row_iter.next().await {
-        // Receive rows
-    }
+    let untraced_query_pager = session.query_iter(untraced_query, &[]).await.unwrap();
+    assert!(untraced_query_pager.tracing_ids().is_empty());
 
-    assert!(untraced_row_iter.get_tracing_ids().is_empty());
-
-    // The same is true for TypedRowIter
-    let untraced_typed_row_iter = untraced_row_iter.into_typed::<(String,)>();
-    assert!(untraced_typed_row_iter.get_tracing_ids().is_empty());
+    let untraced_typed_row_iter = untraced_query_pager.rows_stream::<(String,)>().unwrap();
+    assert!(untraced_typed_row_iter.tracing_ids().is_empty());
 
     // A query with tracing enabled has a tracing ids in result
     let mut traced_query: Query = Query::new(format!("SELECT * FROM {}.tab", ks));
     traced_query.config.tracing = true;
 
-    let mut traced_row_iter = session.query_iter(traced_query, &[]).await.unwrap();
-    while let Some(_row) = traced_row_iter.next().await {
-        // Receive rows
-    }
+    let traced_query_pager = session.query_iter(traced_query, &[]).await.unwrap();
 
-    assert!(!traced_row_iter.get_tracing_ids().is_empty());
+    let traced_typed_row_stream = traced_query_pager.rows_stream::<(String,)>().unwrap();
+    assert!(!traced_typed_row_stream.tracing_ids().is_empty());
 
-    // The same is true for TypedRowIter
-    let traced_typed_row_iter = traced_row_iter.into_typed::<(String,)>();
-    assert!(!traced_typed_row_iter.get_tracing_ids().is_empty());
-
-    for tracing_id in traced_typed_row_iter.get_tracing_ids() {
+    for tracing_id in traced_typed_row_stream.tracing_ids() {
         assert_in_tracing_table(session, *tracing_id).await;
     }
 }
@@ -1085,16 +1137,11 @@ async fn test_tracing_execute_iter(session: &Session, ks: String) {
         .await
         .unwrap();
 
-    let mut untraced_row_iter = session.execute_iter(untraced_prepared, &[]).await.unwrap();
-    while let Some(_row) = untraced_row_iter.next().await {
-        // Receive rows
-    }
+    let untraced_query_pager = session.execute_iter(untraced_prepared, &[]).await.unwrap();
+    assert!(untraced_query_pager.tracing_ids().is_empty());
 
-    assert!(untraced_row_iter.get_tracing_ids().is_empty());
-
-    // The same is true for TypedRowIter
-    let untraced_typed_row_iter = untraced_row_iter.into_typed::<(String,)>();
-    assert!(untraced_typed_row_iter.get_tracing_ids().is_empty());
+    let untraced_typed_row_stream = untraced_query_pager.rows_stream::<(String,)>().unwrap();
+    assert!(untraced_typed_row_stream.tracing_ids().is_empty());
 
     // A prepared statement with tracing enabled has a tracing ids in result
     let mut traced_prepared = session
@@ -1103,18 +1150,12 @@ async fn test_tracing_execute_iter(session: &Session, ks: String) {
         .unwrap();
     traced_prepared.config.tracing = true;
 
-    let mut traced_row_iter = session.execute_iter(traced_prepared, &[]).await.unwrap();
-    while let Some(_row) = traced_row_iter.next().await {
-        // Receive rows
-    }
+    let traced_query_pager = session.execute_iter(traced_prepared, &[]).await.unwrap();
 
-    assert!(!traced_row_iter.get_tracing_ids().is_empty());
+    let traced_typed_row_stream = traced_query_pager.rows_stream::<(String,)>().unwrap();
+    assert!(!traced_typed_row_stream.tracing_ids().is_empty());
 
-    // The same is true for TypedRowIter
-    let traced_typed_row_iter = traced_row_iter.into_typed::<(String,)>();
-    assert!(!traced_typed_row_iter.get_tracing_ids().is_empty());
-
-    for tracing_id in traced_typed_row_iter.get_tracing_ids() {
+    for tracing_id in traced_typed_row_stream.tracing_ids() {
         assert_in_tracing_table(session, *tracing_id).await;
     }
 }
@@ -1125,7 +1166,7 @@ async fn test_tracing_batch(session: &Session, ks: String) {
     untraced_batch.append_statement(&format!("INSERT INTO {}.tab (a) VALUES('a')", ks)[..]);
 
     let untraced_batch_result: QueryResult = session.batch(&untraced_batch, ((),)).await.unwrap();
-    assert!(untraced_batch_result.tracing_id.is_none());
+    assert!(untraced_batch_result.tracing_id().is_none());
 
     // Batch with tracing enabled has a tracing uuid in result
     let mut traced_batch: Batch = Default::default();
@@ -1133,9 +1174,9 @@ async fn test_tracing_batch(session: &Session, ks: String) {
     traced_batch.config.tracing = true;
 
     let traced_batch_result: QueryResult = session.batch(&traced_batch, ((),)).await.unwrap();
-    assert!(traced_batch_result.tracing_id.is_some());
+    assert!(traced_batch_result.tracing_id().is_some());
 
-    assert_in_tracing_table(session, traced_batch_result.tracing_id.unwrap()).await;
+    assert_in_tracing_table(session, traced_batch_result.tracing_id().unwrap()).await;
 }
 
 async fn assert_in_tracing_table(session: &Session, tracing_uuid: Uuid) {
@@ -1154,9 +1195,9 @@ async fn assert_in_tracing_table(session: &Session, tracing_uuid: Uuid) {
             .query_unpaged(traces_query.clone(), (tracing_uuid,))
             .await
             .unwrap()
-            .rows_num()
-            .unwrap();
-
+            .into_rows_result()
+            .unwrap()
+            .rows_num();
         if rows_num > 0 {
             // Ok there was some row for this tracing_uuid
             return;
@@ -1178,27 +1219,17 @@ async fn test_await_schema_agreement() {
 }
 
 #[tokio::test]
-async fn test_await_timed_schema_agreement() {
-    setup_tracing();
-    let session = create_new_session_builder().build().await.unwrap();
-    session.await_schema_agreement().await.unwrap();
-}
-
-#[tokio::test]
 async fn test_timestamp() {
     setup_tracing();
     let session = create_new_session_builder().build().await.unwrap();
     let ks = unique_keyspace_name();
 
-    session.query_unpaged(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks), &[]).await.unwrap();
+    session.ddl(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks)).await.unwrap();
     session
-        .query_unpaged(
-            format!(
-                "CREATE TABLE IF NOT EXISTS {}.t_timestamp (a text, b text, primary key (a))",
-                ks
-            ),
-            &[],
-        )
+        .ddl(format!(
+            "CREATE TABLE IF NOT EXISTS {}.t_timestamp (a text, b text, primary key (a))",
+            ks
+        ))
         .await
         .unwrap();
 
@@ -1268,14 +1299,18 @@ async fn test_timestamp() {
         .await
         .unwrap();
 
-    let mut results = session
+    let query_rows_result = session
         .query_unpaged(
             format!("SELECT a, b, WRITETIME(b) FROM {}.t_timestamp", ks),
             &[],
         )
         .await
         .unwrap()
-        .rows_typed::<(String, String, i64)>()
+        .into_rows_result()
+        .unwrap();
+
+    let mut results = query_rows_result
+        .rows::<(&str, &str, i64)>()
         .unwrap()
         .map(Result::unwrap)
         .collect::<Vec<_>>();
@@ -1287,8 +1322,7 @@ async fn test_timestamp() {
         ("regular query", "higher timestamp", 420),
         ("second query in batch", "higher timestamp", 420),
     ]
-    .iter()
-    .map(|(x, y, t)| (x.to_string(), y.to_string(), *t))
+    .into_iter()
     .collect::<Vec<_>>();
 
     assert_eq!(results, expected_results);
@@ -1456,7 +1490,7 @@ async fn test_schema_types_in_metadata() {
     let ks = unique_keyspace_name();
 
     session
-        .query_unpaged(format!("CREATE KEYSPACE {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks), &[])
+        .ddl(format!("CREATE KEYSPACE {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks))
         .await
         .unwrap();
 
@@ -1466,31 +1500,27 @@ async fn test_schema_types_in_metadata() {
         .unwrap();
 
     session
-        .query_unpaged(
+        .ddl(
             "CREATE TYPE IF NOT EXISTS type_a (
                     a map<frozen<list<int>>, text>,
                     b frozen<map<frozen<list<int>>, frozen<set<text>>>>
                    )",
-            &[],
         )
         .await
         .unwrap();
 
     session
-        .query_unpaged("CREATE TYPE IF NOT EXISTS type_b (a int, b text)", &[])
+        .ddl("CREATE TYPE IF NOT EXISTS type_b (a int, b text)")
         .await
         .unwrap();
 
     session
-        .query_unpaged(
-            "CREATE TYPE IF NOT EXISTS type_c (a map<frozen<set<text>>, frozen<type_b>>)",
-            &[],
-        )
+        .ddl("CREATE TYPE IF NOT EXISTS type_c (a map<frozen<set<text>>, frozen<type_b>>)")
         .await
         .unwrap();
 
     session
-        .query_unpaged(
+        .ddl(
             "CREATE TABLE IF NOT EXISTS table_a (
                     a frozen<type_a> PRIMARY KEY,
                     b type_b,
@@ -1498,18 +1528,16 @@ async fn test_schema_types_in_metadata() {
                     d map<text, frozen<list<int>>>,
                     e tuple<int, text>
                   )",
-            &[],
         )
         .await
         .unwrap();
 
     session
-        .query_unpaged(
+        .ddl(
             "CREATE TABLE IF NOT EXISTS table_b (
                         a text PRIMARY KEY,
                         b frozen<map<int, int>>
                      )",
-            &[],
         )
         .await
         .unwrap();
@@ -1615,7 +1643,7 @@ async fn test_user_defined_types_in_metadata() {
     let ks = unique_keyspace_name();
 
     session
-        .query_unpaged(format!("CREATE KEYSPACE {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks), &[])
+        .ddl(format!("CREATE KEYSPACE {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks))
         .await
         .unwrap();
 
@@ -1625,26 +1653,22 @@ async fn test_user_defined_types_in_metadata() {
         .unwrap();
 
     session
-        .query_unpaged(
+        .ddl(
             "CREATE TYPE IF NOT EXISTS type_a (
                     a map<frozen<list<int>>, text>,
                     b frozen<map<frozen<list<int>>, frozen<set<text>>>>
                    )",
-            &[],
         )
         .await
         .unwrap();
 
     session
-        .query_unpaged("CREATE TYPE IF NOT EXISTS type_b (a int, b text)", &[])
+        .ddl("CREATE TYPE IF NOT EXISTS type_b (a int, b text)")
         .await
         .unwrap();
 
     session
-        .query_unpaged(
-            "CREATE TYPE IF NOT EXISTS type_c (a map<frozen<set<text>>, frozen<type_b>>)",
-            &[],
-        )
+        .ddl("CREATE TYPE IF NOT EXISTS type_c (a map<frozen<set<text>>, frozen<type_b>>)")
         .await
         .unwrap();
 
@@ -1679,7 +1703,7 @@ async fn test_column_kinds_in_metadata() {
     let ks = unique_keyspace_name();
 
     session
-        .query_unpaged(format!("CREATE KEYSPACE {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks), &[])
+        .ddl(format!("CREATE KEYSPACE {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks))
         .await
         .unwrap();
 
@@ -1689,7 +1713,7 @@ async fn test_column_kinds_in_metadata() {
         .unwrap();
 
     session
-        .query_unpaged(
+        .ddl(
             "CREATE TABLE IF NOT EXISTS t (
                     a int,
                     b int,
@@ -1699,7 +1723,6 @@ async fn test_column_kinds_in_metadata() {
                     f int,
                     PRIMARY KEY ((c, e), b, a)
                   )",
-            &[],
         )
         .await
         .unwrap();
@@ -1725,7 +1748,7 @@ async fn test_primary_key_ordering_in_metadata() {
     let ks = unique_keyspace_name();
 
     session
-        .query_unpaged(format!("CREATE KEYSPACE {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks), &[])
+        .ddl(format!("CREATE KEYSPACE {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks))
         .await
         .unwrap();
 
@@ -1735,7 +1758,7 @@ async fn test_primary_key_ordering_in_metadata() {
         .unwrap();
 
     session
-        .query_unpaged(
+        .ddl(
             "CREATE TABLE IF NOT EXISTS t (
                     a int,
                     b int,
@@ -1748,7 +1771,6 @@ async fn test_primary_key_ordering_in_metadata() {
                     i int STATIC,
                     PRIMARY KEY ((c, e), b, a)
                   )",
-            &[],
         )
         .await
         .unwrap();
@@ -1781,7 +1803,7 @@ async fn test_table_partitioner_in_metadata() {
         create_ks += " AND TABLETS = {'enabled': false}";
     }
 
-    session.query_unpaged(create_ks, &[]).await.unwrap();
+    session.ddl(create_ks).await.unwrap();
 
     session
         .query_unpaged(format!("USE {}", ks), &[])
@@ -1789,9 +1811,8 @@ async fn test_table_partitioner_in_metadata() {
         .unwrap();
 
     session
-        .query_unpaged(
+        .ddl(
             "CREATE TABLE t (pk int, ck int, v int, PRIMARY KEY (pk, ck, v))WITH cdc = {'enabled':true}",
-            &[],
         )
         .await
         .unwrap();
@@ -1822,7 +1843,7 @@ async fn test_turning_off_schema_fetching() {
     let ks = unique_keyspace_name();
 
     session
-        .query_unpaged(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks), &[])
+        .ddl(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks))
         .await
         .unwrap();
 
@@ -1832,31 +1853,27 @@ async fn test_turning_off_schema_fetching() {
         .unwrap();
 
     session
-        .query_unpaged(
+        .ddl(
             "CREATE TYPE IF NOT EXISTS type_a (
                     a map<frozen<list<int>>, text>,
                     b frozen<map<frozen<list<int>>, frozen<set<text>>>>
                    )",
-            &[],
         )
         .await
         .unwrap();
 
     session
-        .query_unpaged("CREATE TYPE IF NOT EXISTS type_b (a int, b text)", &[])
+        .ddl("CREATE TYPE IF NOT EXISTS type_b (a int, b text)")
         .await
         .unwrap();
 
     session
-        .query_unpaged(
-            "CREATE TYPE IF NOT EXISTS type_c (a map<frozen<set<text>>, frozen<type_b>>)",
-            &[],
-        )
+        .ddl("CREATE TYPE IF NOT EXISTS type_c (a map<frozen<set<text>>, frozen<type_b>>)")
         .await
         .unwrap();
 
     session
-        .query_unpaged(
+        .ddl(
             "CREATE TABLE IF NOT EXISTS table_a (
                     a frozen<type_a> PRIMARY KEY,
                     b type_b,
@@ -1864,7 +1881,6 @@ async fn test_turning_off_schema_fetching() {
                     d map<text, frozen<list<int>>>,
                     e tuple<int, text>
                   )",
-            &[],
         )
         .await
         .unwrap();
@@ -1896,7 +1912,7 @@ async fn test_named_bind_markers() {
     let ks = unique_keyspace_name();
 
     session
-        .query_unpaged(format!("CREATE KEYSPACE {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks), &[])
+        .ddl(format!("CREATE KEYSPACE {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks))
         .await
         .unwrap();
 
@@ -1906,10 +1922,7 @@ async fn test_named_bind_markers() {
         .unwrap();
 
     session
-        .query_unpaged(
-            "CREATE TABLE t (pk int, ck int, v int, PRIMARY KEY (pk, ck, v))",
-            &[],
-        )
+        .ddl("CREATE TABLE t (pk int, ck int, v int, PRIMARY KEY (pk, ck, v))")
         .await
         .unwrap();
 
@@ -1929,7 +1942,9 @@ async fn test_named_bind_markers() {
         .query_unpaged("SELECT pk, ck, v FROM t", &[])
         .await
         .unwrap()
-        .rows_typed::<(i32, i32, i32)>()
+        .into_rows_result()
+        .unwrap()
+        .rows::<(i32, i32, i32)>()
         .unwrap()
         .map(|res| res.unwrap())
         .collect();
@@ -1959,11 +1974,11 @@ async fn test_prepared_partitioner() {
         create_ks += " AND TABLETS = {'enabled': false}"
     }
 
-    session.query_unpaged(create_ks, &[]).await.unwrap();
+    session.ddl(create_ks).await.unwrap();
     session.use_keyspace(ks, false).await.unwrap();
 
     session
-        .query_unpaged("CREATE TABLE IF NOT EXISTS t1 (a int primary key)", &[])
+        .ddl("CREATE TABLE IF NOT EXISTS t1 (a int primary key)")
         .await
         .unwrap();
 
@@ -1985,10 +2000,7 @@ async fn test_prepared_partitioner() {
     }
 
     session
-        .query_unpaged(
-            "CREATE TABLE IF NOT EXISTS t2 (a int primary key) WITH cdc = {'enabled':true}",
-            &[],
-        )
+        .ddl("CREATE TABLE IF NOT EXISTS t2 (a int primary key) WITH cdc = {'enabled':true}")
         .await
         .unwrap();
 
@@ -2008,14 +2020,14 @@ async fn test_prepared_partitioner() {
 
 async fn rename(session: &Session, rename_str: &str) {
     session
-        .query_unpaged(format!("ALTER TABLE tab RENAME {}", rename_str), ())
+        .ddl(format!("ALTER TABLE tab RENAME {}", rename_str))
         .await
         .unwrap();
 }
 
 async fn rename_caching(session: &CachingSession, rename_str: &str) {
     session
-        .execute_unpaged(format!("ALTER TABLE tab RENAME {}", rename_str), &())
+        .ddl(format!("ALTER TABLE tab RENAME {}", rename_str))
         .await
         .unwrap();
 }
@@ -2034,14 +2046,11 @@ async fn test_unprepared_reprepare_in_execute() {
     let session = create_new_session_builder().build().await.unwrap();
     let ks = unique_keyspace_name();
 
-    session.query_unpaged(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks), &[]).await.unwrap();
+    session.ddl(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks)).await.unwrap();
     session.use_keyspace(ks, false).await.unwrap();
 
     session
-        .query_unpaged(
-            "CREATE TABLE IF NOT EXISTS tab (a int, b int, c int, primary key (a, b, c))",
-            &[],
-        )
+        .ddl("CREATE TABLE IF NOT EXISTS tab (a int, b int, c int, primary key (a, b, c))")
         .await
         .unwrap();
 
@@ -2080,7 +2089,9 @@ async fn test_unprepared_reprepare_in_execute() {
         .query_unpaged("SELECT a, b, c FROM tab", ())
         .await
         .unwrap()
-        .rows_typed::<(i32, i32, i32)>()
+        .into_rows_result()
+        .unwrap()
+        .rows::<(i32, i32, i32)>()
         .unwrap()
         .map(|r| r.unwrap())
         .collect();
@@ -2095,14 +2106,11 @@ async fn test_unusual_valuelists() {
     let session = create_new_session_builder().build().await.unwrap();
     let ks = unique_keyspace_name();
 
-    session.query_unpaged(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks), &[]).await.unwrap();
+    session.ddl(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks)).await.unwrap();
     session.use_keyspace(ks, false).await.unwrap();
 
     session
-        .query_unpaged(
-            "CREATE TABLE IF NOT EXISTS tab (a int, b int, c varchar, primary key (a, b, c))",
-            &[],
-        )
+        .ddl("CREATE TABLE IF NOT EXISTS tab (a int, b int, c varchar, primary key (a, b, c))")
         .await
         .unwrap();
 
@@ -2135,7 +2143,9 @@ async fn test_unusual_valuelists() {
         .query_unpaged("SELECT a, b, c FROM tab", ())
         .await
         .unwrap()
-        .rows_typed::<(i32, i32, String)>()
+        .into_rows_result()
+        .unwrap()
+        .rows::<(i32, i32, String)>()
         .unwrap()
         .map(|r| r.unwrap())
         .collect();
@@ -2163,14 +2173,11 @@ async fn test_unprepared_reprepare_in_batch() {
     let session = create_new_session_builder().build().await.unwrap();
     let ks = unique_keyspace_name();
 
-    session.query_unpaged(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks), &[]).await.unwrap();
+    session.ddl(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks)).await.unwrap();
     session.use_keyspace(ks, false).await.unwrap();
 
     session
-        .query_unpaged(
-            "CREATE TABLE IF NOT EXISTS tab (a int, b int, c int, primary key (a, b, c))",
-            &[],
-        )
+        .ddl("CREATE TABLE IF NOT EXISTS tab (a int, b int, c int, primary key (a, b, c))")
         .await
         .unwrap();
 
@@ -2206,7 +2213,9 @@ async fn test_unprepared_reprepare_in_batch() {
         .query_unpaged("SELECT a, b, c FROM tab", ())
         .await
         .unwrap()
-        .rows_typed::<(i32, i32, i32)>()
+        .into_rows_result()
+        .unwrap()
+        .rows::<(i32, i32, i32)>()
         .unwrap()
         .map(|r| r.unwrap())
         .collect();
@@ -2228,16 +2237,13 @@ async fn test_unprepared_reprepare_in_caching_session_execute() {
     let session = create_new_session_builder().build().await.unwrap();
     let ks = unique_keyspace_name();
 
-    session.query_unpaged(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks), &[]).await.unwrap();
+    session.ddl(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks)).await.unwrap();
     session.use_keyspace(ks, false).await.unwrap();
 
     let caching_session: CachingSession = CachingSession::from(session, 64);
 
     caching_session
-        .execute_unpaged(
-            "CREATE TABLE IF NOT EXISTS tab (a int, b int, c int, primary key (a, b, c))",
-            &[],
-        )
+        .ddl("CREATE TABLE IF NOT EXISTS tab (a int, b int, c int, primary key (a, b, c))")
         .await
         .unwrap();
 
@@ -2273,7 +2279,9 @@ async fn test_unprepared_reprepare_in_caching_session_execute() {
         .execute_unpaged("SELECT a, b, c FROM tab", &())
         .await
         .unwrap()
-        .rows_typed::<(i32, i32, i32)>()
+        .into_rows_result()
+        .unwrap()
+        .rows::<(i32, i32, i32)>()
         .unwrap()
         .map(|r| r.unwrap())
         .collect();
@@ -2288,16 +2296,16 @@ async fn test_views_in_schema_info() {
     let session = create_new_session_builder().build().await.unwrap();
     let ks = unique_keyspace_name();
 
-    session.query_unpaged(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks), &[]).await.unwrap();
+    session.ddl(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks)).await.unwrap();
     session.use_keyspace(ks.clone(), false).await.unwrap();
 
     session
-        .query_unpaged("CREATE TABLE t(id int PRIMARY KEY, v int)", &[])
+        .ddl("CREATE TABLE t(id int PRIMARY KEY, v int)")
         .await
         .unwrap();
 
-    session.query_unpaged("CREATE MATERIALIZED VIEW mv1 AS SELECT * FROM t WHERE v IS NOT NULL PRIMARY KEY (v, id)", &[]).await.unwrap();
-    session.query_unpaged("CREATE MATERIALIZED VIEW mv2 AS SELECT id, v FROM t WHERE v IS NOT NULL PRIMARY KEY (v, id)", &[]).await.unwrap();
+    session.ddl("CREATE MATERIALIZED VIEW mv1 AS SELECT * FROM t WHERE v IS NOT NULL PRIMARY KEY (v, id)").await.unwrap();
+    session.ddl("CREATE MATERIALIZED VIEW mv2 AS SELECT id, v FROM t WHERE v IS NOT NULL PRIMARY KEY (v, id)").await.unwrap();
 
     session.await_schema_agreement().await.unwrap();
     session.refresh_metadata().await.unwrap();
@@ -2340,7 +2348,9 @@ async fn assert_test_batch_table_rows_contain(sess: &Session, expected_rows: &[(
         .query_unpaged("SELECT a, b FROM test_batch_table", ())
         .await
         .unwrap()
-        .rows_typed::<(i32, i32)>()
+        .into_rows_result()
+        .unwrap()
+        .rows::<(i32, i32)>()
         .unwrap()
         .map(|r| r.unwrap())
         .collect();
@@ -2359,14 +2369,11 @@ async fn test_prepare_batch() {
     let session = create_new_session_builder().build().await.unwrap();
 
     let ks = unique_keyspace_name();
-    session.query_unpaged(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks), &[]).await.unwrap();
+    session.ddl(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks)).await.unwrap();
     session.use_keyspace(ks.clone(), false).await.unwrap();
 
     session
-        .query_unpaged(
-            "CREATE TABLE test_batch_table (a int, b int, primary key (a, b))",
-            (),
-        )
+        .ddl("CREATE TABLE test_batch_table (a int, b int, primary key (a, b))")
         .await
         .unwrap();
 
@@ -2456,14 +2463,11 @@ async fn test_refresh_metadata_after_schema_agreement() {
     let session = create_new_session_builder().build().await.unwrap();
 
     let ks = unique_keyspace_name();
-    session.query_unpaged(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks), &[]).await.unwrap();
+    session.ddl(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks)).await.unwrap();
     session.use_keyspace(ks.clone(), false).await.unwrap();
 
     session
-        .query_unpaged(
-            "CREATE TYPE udt (field1 int, field2 uuid, field3 text)",
-            &[],
-        )
+        .ddl("CREATE TYPE udt (field1 int, field2 uuid, field3 text)")
         .await
         .unwrap();
 
@@ -2502,9 +2506,9 @@ async fn test_rate_limit_exceeded_exception() {
     }
 
     let ks = unique_keyspace_name();
-    session.query_unpaged(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks), &[]).await.unwrap();
+    session.ddl(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks)).await.unwrap();
     session.use_keyspace(ks.clone(), false).await.unwrap();
-    session.query_unpaged("CREATE TABLE tbl (pk int PRIMARY KEY, v int) WITH per_partition_rate_limit = {'max_writes_per_second': 1}", ()).await.unwrap();
+    session.ddl("CREATE TABLE tbl (pk int PRIMARY KEY, v int) WITH per_partition_rate_limit = {'max_writes_per_second': 1}").await.unwrap();
 
     let stmt = session
         .prepare("INSERT INTO tbl (pk, v) VALUES (?, ?)")
@@ -2546,14 +2550,11 @@ async fn test_batch_lwts() {
     if scylla_supports_tablets(&session).await {
         create_ks += " and TABLETS = { 'enabled': false}";
     }
-    session.query_unpaged(create_ks, &[]).await.unwrap();
+    session.ddl(create_ks).await.unwrap();
     session.use_keyspace(ks.clone(), false).await.unwrap();
 
     session
-        .query_unpaged(
-            "CREATE TABLE tab (p1 int, c1 int, r1 int, r2 int, primary key (p1, c1))",
-            (),
-        )
+        .ddl("CREATE TABLE tab (p1 int, c1 int, r1 int, r2 int, primary key (p1, c1))")
         .await
         .unwrap();
 
@@ -2568,28 +2569,33 @@ async fn test_batch_lwts() {
     batch.append_statement("UPDATE tab SET r1 = 1 WHERE p1 = 0 AND c1 = 0 IF r2 = 0");
 
     let batch_res: QueryResult = session.batch(&batch, ((), (), ())).await.unwrap();
+    let batch_deserializer = batch_res.into_rows_result().unwrap();
 
     // Scylla returns 5 columns, but Cassandra returns only 1
-    let is_scylla: bool = batch_res.col_specs().len() == 5;
+    let is_scylla: bool = batch_deserializer.column_specs().len() == 5;
 
     if is_scylla {
-        test_batch_lwts_for_scylla(&session, &batch, batch_res).await;
+        test_batch_lwts_for_scylla(&session, &batch, &batch_deserializer).await;
     } else {
-        test_batch_lwts_for_cassandra(&session, &batch, batch_res).await;
+        test_batch_lwts_for_cassandra(&session, &batch, &batch_deserializer).await;
     }
 }
 
-async fn test_batch_lwts_for_scylla(session: &Session, batch: &Batch, batch_res: QueryResult) {
+async fn test_batch_lwts_for_scylla(
+    session: &Session,
+    batch: &Batch,
+    query_rows_result: &QueryRowsResult,
+) {
     // Alias required by clippy
     type IntOrNull = Option<i32>;
 
     // Returned columns are:
     // [applied], p1, c1, r1, r2
-    let batch_res_rows: Vec<(bool, IntOrNull, IntOrNull, IntOrNull, IntOrNull)> = batch_res
-        .rows_typed()
+    let batch_res_rows: Vec<(bool, IntOrNull, IntOrNull, IntOrNull, IntOrNull)> = query_rows_result
+        .rows()
         .unwrap()
-        .map(|r| r.unwrap())
-        .collect();
+        .collect::<Result<_, _>>()
+        .unwrap();
 
     let expected_batch_res_rows = vec![
         (true, Some(0), Some(0), Some(0), Some(0)),
@@ -2605,7 +2611,9 @@ async fn test_batch_lwts_for_scylla(session: &Session, batch: &Batch, batch_res:
 
     let prepared_batch_res_rows: Vec<(bool, IntOrNull, IntOrNull, IntOrNull, IntOrNull)> =
         prepared_batch_res
-            .rows_typed()
+            .into_rows_result()
+            .unwrap()
+            .rows()
             .unwrap()
             .map(|r| r.unwrap())
             .collect();
@@ -2619,14 +2627,18 @@ async fn test_batch_lwts_for_scylla(session: &Session, batch: &Batch, batch_res:
     assert_eq!(prepared_batch_res_rows, expected_prepared_batch_res_rows);
 }
 
-async fn test_batch_lwts_for_cassandra(session: &Session, batch: &Batch, batch_res: QueryResult) {
+async fn test_batch_lwts_for_cassandra(
+    session: &Session,
+    batch: &Batch,
+    query_rows_result: &QueryRowsResult,
+) {
     // Alias required by clippy
     type IntOrNull = Option<i32>;
 
     // Returned columns are:
     // [applied]
-    let batch_res_rows: Vec<(bool,)> = batch_res
-        .rows_typed()
+    let batch_res_rows: Vec<(bool,)> = query_rows_result
+        .rows()
         .unwrap()
         .map(|r| r.unwrap())
         .collect();
@@ -2643,7 +2655,9 @@ async fn test_batch_lwts_for_cassandra(session: &Session, batch: &Batch, batch_r
     // [applied], p1, c1, r1, r2
     let prepared_batch_res_rows: Vec<(bool, IntOrNull, IntOrNull, IntOrNull, IntOrNull)> =
         prepared_batch_res
-            .rows_typed()
+            .into_rows_result()
+            .unwrap()
+            .rows()
             .unwrap()
             .map(|r| r.unwrap())
             .collect();
@@ -2661,7 +2675,7 @@ async fn test_keyspaces_to_fetch() {
     let session_default = create_new_session_builder().build().await.unwrap();
     for ks in [&ks1, &ks2] {
         session_default
-            .query_unpaged(format!("CREATE KEYSPACE {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks), &[])
+            .ddl(format!("CREATE KEYSPACE {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks))
             .await
             .unwrap();
     }
@@ -2738,23 +2752,25 @@ async fn test_iter_works_when_retry_policy_returns_ignore_write_error() {
     if scylla_supports_tablets(&session).await {
         create_ks += " and TABLETS = { 'enabled': false}";
     }
-    session.query_unpaged(create_ks, ()).await.unwrap();
+    session.ddl(create_ks).await.unwrap();
     session.use_keyspace(ks, true).await.unwrap();
     session
-        .query_unpaged("CREATE TABLE t (pk int PRIMARY KEY, v int)", ())
+        .ddl("CREATE TABLE t (pk int PRIMARY KEY, v int)")
         .await
         .unwrap();
 
     assert!(!retried_flag.load(Ordering::Relaxed));
     // Try to write something to the new table - it should fail and the policy
     // will tell us to ignore the error
-    let mut iter = session
+    let mut stream = session
         .query_iter("INSERT INTO t (pk v) VALUES (1, 2)", ())
         .await
+        .unwrap()
+        .rows_stream::<Row>()
         .unwrap();
 
     assert!(retried_flag.load(Ordering::Relaxed));
-    while iter.try_next().await.unwrap().is_some() {}
+    while stream.try_next().await.unwrap().is_some() {}
 
     retried_flag.store(false, Ordering::Relaxed);
     // Try the same with execute_iter()
@@ -2762,7 +2778,13 @@ async fn test_iter_works_when_retry_policy_returns_ignore_write_error() {
         .prepare("INSERT INTO t (pk, v) VALUES (?, ?)")
         .await
         .unwrap();
-    let mut iter = session.execute_iter(p, (1, 2)).await.unwrap();
+    let mut iter = session
+        .execute_iter(p, (1, 2))
+        .await
+        .unwrap()
+        .rows_stream::<Row>()
+        .unwrap()
+        .into_stream();
 
     assert!(retried_flag.load(Ordering::Relaxed));
     while iter.try_next().await.unwrap().is_some() {}
@@ -2773,15 +2795,12 @@ async fn test_iter_methods_with_modification_statements() {
     let session = create_new_session_builder().build().await.unwrap();
     let ks = unique_keyspace_name();
 
-    session.query_unpaged(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks), &[]).await.unwrap();
+    session.ddl(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks)).await.unwrap();
     session
-        .query_unpaged(
-            format!(
-                "CREATE TABLE IF NOT EXISTS {}.t (a int, b int, c text, primary key (a, b))",
-                ks
-            ),
-            &[],
-        )
+        .ddl(format!(
+            "CREATE TABLE IF NOT EXISTS {}.t (a int, b int, c text, primary key (a, b))",
+            ks
+        ))
         .await
         .unwrap();
 
@@ -2790,19 +2809,30 @@ async fn test_iter_methods_with_modification_statements() {
         ks
     ));
     query.set_tracing(true);
-    let mut row_iterator = session.query_iter(query, &[]).await.unwrap();
-    row_iterator.next().await.ok_or(()).unwrap_err(); // assert empty
-    assert!(!row_iterator.get_tracing_ids().is_empty());
+    let mut rows_stream = session
+        .query_iter(query, &[])
+        .await
+        .unwrap()
+        .rows_stream::<Row>()
+        .unwrap();
+    rows_stream.next().await.ok_or(()).unwrap_err(); // assert empty
+    assert!(!rows_stream.tracing_ids().is_empty());
 
     let prepared_statement = session
         .prepare(format!("INSERT INTO {}.t (a, b, c) VALUES (?, ?, ?)", ks))
         .await
         .unwrap();
-    let mut row_iterator = session
+    let query_pager = session
         .execute_iter(prepared_statement, (2, 3, "cba"))
         .await
         .unwrap();
-    row_iterator.next().await.ok_or(()).unwrap_err(); // assert empty
+    query_pager
+        .rows_stream::<()>()
+        .unwrap()
+        .next()
+        .await
+        .ok_or(())
+        .unwrap_err(); // assert empty
 }
 
 #[tokio::test]
@@ -2813,7 +2843,7 @@ async fn test_get_keyspace_name() {
     // No keyspace is set in config, so get_keyspace() should return None.
     let session = create_new_session_builder().build().await.unwrap();
     assert_eq!(session.get_keyspace(), None);
-    session.query_unpaged(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks), &[]).await.unwrap();
+    session.ddl(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks)).await.unwrap();
     assert_eq!(session.get_keyspace(), None);
 
     // Call use_keyspace(), get_keyspace now should return the new keyspace name
@@ -2839,25 +2869,19 @@ async fn simple_strategy_test() {
     let session = create_new_session_builder().build().await.unwrap();
 
     session
-        .query_unpaged(
-            format!(
-                "CREATE KEYSPACE {} WITH REPLICATION = \
+        .ddl(format!(
+            "CREATE KEYSPACE {} WITH REPLICATION = \
                 {{'class': 'SimpleStrategy', 'replication_factor': 1}}",
-                ks
-            ),
-            (),
-        )
+            ks
+        ))
         .await
         .unwrap();
 
     session
-        .query_unpaged(
-            format!(
-                "CREATE TABLE {}.tab (p int, c int, r int, PRIMARY KEY (p, c, r))",
-                ks
-            ),
-            (),
-        )
+        .ddl(format!(
+            "CREATE TABLE {}.tab (p int, c int, r int, PRIMARY KEY (p, c, r))",
+            ks
+        ))
         .await
         .unwrap();
 
@@ -2888,7 +2912,9 @@ async fn simple_strategy_test() {
         .query_unpaged(format!("SELECT p, c, r FROM {}.tab", ks), ())
         .await
         .unwrap()
-        .rows_typed::<(i32, i32, i32)>()
+        .into_rows_result()
+        .unwrap()
+        .rows::<(i32, i32, i32)>()
         .unwrap()
         .map(|r| r.unwrap())
         .collect::<Vec<(i32, i32, i32)>>();
@@ -2902,7 +2928,7 @@ async fn test_manual_primary_key_computation() {
     // Setup session
     let ks = unique_keyspace_name();
     let session = create_new_session_builder().build().await.unwrap();
-    session.query_unpaged(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks), &[]).await.unwrap();
+    session.ddl(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks)).await.unwrap();
     session.use_keyspace(&ks, true).await.unwrap();
 
     async fn assert_tokens_equal(
@@ -2937,10 +2963,7 @@ async fn test_manual_primary_key_computation() {
     // Single-column partition key
     {
         session
-            .query_unpaged(
-                "CREATE TABLE IF NOT EXISTS t2 (a int, b int, c text, primary key (a, b))",
-                &[],
-            )
+            .ddl("CREATE TABLE IF NOT EXISTS t2 (a int, b int, c text, primary key (a, b))")
             .await
             .unwrap();
 
@@ -2968,7 +2991,7 @@ async fn test_manual_primary_key_computation() {
     // Composite partition key
     {
         session
-            .query_unpaged("CREATE TABLE IF NOT EXISTS complex_pk (a int, b int, c text, d int, e int, primary key ((a,b,c),d))", &[])
+            .ddl("CREATE TABLE IF NOT EXISTS complex_pk (a int, b int, c text, d int, e int, primary key ((a,b,c),d))")
             .await
             .unwrap();
 
@@ -2999,4 +3022,212 @@ async fn test_manual_primary_key_computation() {
         )
         .await;
     }
+}
+
+/// ScyllaDB does not distinguish empty collections from nulls. That is, INSERTing an empty collection
+/// is equivalent to nullifying the corresponding column.
+/// As pointed out in [#1001](https://github.com/scylladb/scylla-rust-driver/issues/1001), it's a nice
+/// QOL feature to be able to deserialize empty CQL collections to empty Rust collections instead of
+/// `None::<RustCollection>`. This test checks that.
+#[tokio::test]
+async fn test_deserialize_empty_collections() {
+    // Setup session.
+    let ks = unique_keyspace_name();
+    let session = create_new_session_builder().build().await.unwrap();
+    session.ddl(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks)).await.unwrap();
+    session.use_keyspace(&ks, true).await.unwrap();
+
+    async fn deserialize_empty_collection<
+        Collection: Default + DeserializeOwnedValue + SerializeValue,
+    >(
+        session: &Session,
+        collection_name: &str,
+        collection_type_params: &str,
+    ) -> Collection {
+        // Create a table for the given collection type.
+        let table_name = "test_empty_".to_owned() + collection_name;
+        let query = format!(
+            "CREATE TABLE {} (n int primary key, c {}<{}>)",
+            table_name, collection_name, collection_type_params
+        );
+        session.ddl(query).await.unwrap();
+
+        // Populate the table with an empty collection, effectively inserting null as the collection.
+        session
+            .query_unpaged(
+                format!("INSERT INTO {} (n, c) VALUES (?, ?)", table_name,),
+                (0, Collection::default()),
+            )
+            .await
+            .unwrap();
+
+        let query_rows_result = session
+            .query_unpaged(format!("SELECT c FROM {}", table_name), ())
+            .await
+            .unwrap()
+            .into_rows_result()
+            .unwrap();
+        let (collection,) = query_rows_result.first_row::<(Collection,)>().unwrap();
+
+        // Drop the table
+        collection
+    }
+
+    let list = deserialize_empty_collection::<Vec<i32>>(&session, "list", "int").await;
+    assert!(list.is_empty());
+
+    let set = deserialize_empty_collection::<HashSet<i64>>(&session, "set", "bigint").await;
+    assert!(set.is_empty());
+
+    let map = deserialize_empty_collection::<HashMap<bool, CqlVarint>>(
+        &session,
+        "map",
+        "boolean, varint",
+    )
+    .await;
+    assert!(map.is_empty());
+}
+
+#[tokio::test]
+#[allow(deprecated)]
+async fn test_api_migration_session_sharing() {
+    {
+        let session = create_new_session_builder().build().await.unwrap();
+        let session_shared = session.make_shared_session_with_legacy_api();
+
+        // If we are unlucky then we will race with metadata fetch/cluster update
+        // and both invocations will return different cluster data. This should be
+        // SUPER rare, but in order to reduce the chance of flakiness to a minimum
+        // we will try it three times in a row. Cluster data is updated once per
+        // minute, so this should be good enough.
+        let mut matched = false;
+        for _ in 0..3 {
+            let cd1 = session.get_cluster_data();
+            let cd2 = session_shared.get_cluster_data();
+
+            if Arc::ptr_eq(&cd1, &cd2) {
+                matched = true;
+                break;
+            }
+        }
+        assert!(matched);
+    }
+    {
+        let session = create_new_session_builder().build_legacy().await.unwrap();
+        let session_shared = session.make_shared_session_with_new_api();
+
+        let mut matched = false;
+        for _ in 0..3 {
+            let cd1 = session.get_cluster_data();
+            let cd2 = session_shared.get_cluster_data();
+
+            if Arc::ptr_eq(&cd1, &cd2) {
+                matched = true;
+                break;
+            }
+        }
+        assert!(matched);
+    }
+}
+
+#[cfg(cassandra_tests)]
+#[tokio::test]
+async fn test_vector_type_metadata() {
+    setup_tracing();
+    let session = create_new_session_builder().build().await.unwrap();
+    let ks = unique_keyspace_name();
+
+    session.ddl(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks)).await.unwrap();
+    session
+        .ddl(
+            format!(
+                "CREATE TABLE IF NOT EXISTS {}.t (a int PRIMARY KEY, b vector<int, 4>, c vector<text, 2>)",
+                ks
+            ),
+        )
+        .await
+        .unwrap();
+
+    session.refresh_metadata().await.unwrap();
+    let metadata = session.get_cluster_data();
+    let columns = &metadata.keyspaces[&ks].tables["t"].columns;
+    assert_eq!(
+        columns["b"].type_,
+        CqlType::Vector {
+            type_: Box::new(CqlType::Native(NativeType::Int)),
+            dimensions: 4,
+        },
+    );
+    assert_eq!(
+        columns["c"].type_,
+        CqlType::Vector {
+            type_: Box::new(CqlType::Native(NativeType::Text)),
+            dimensions: 2,
+        },
+    );
+}
+
+#[cfg(cassandra_tests)]
+#[tokio::test]
+async fn test_vector_type_unprepared() {
+    setup_tracing();
+    let session = create_new_session_builder().build().await.unwrap();
+    let ks = unique_keyspace_name();
+
+    session.ddl(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks)).await.unwrap();
+    session
+        .ddl(
+            format!(
+                "CREATE TABLE IF NOT EXISTS {}.t (a int PRIMARY KEY, b vector<int, 4>, c vector<text, 2>)",
+                ks
+            ),
+        )
+        .await
+        .unwrap();
+
+    session
+        .query_unpaged(
+            format!(
+                "INSERT INTO {}.t (a, b, c) VALUES (1, [1, 2, 3, 4], ['foo', 'bar'])",
+                ks
+            ),
+            &[],
+        )
+        .await
+        .unwrap();
+
+    // TODO: Implement and test SELECT statements and bind values (`?`)
+}
+
+#[cfg(cassandra_tests)]
+#[tokio::test]
+async fn test_vector_type_prepared() {
+    setup_tracing();
+    let session = create_new_session_builder().build().await.unwrap();
+    let ks = unique_keyspace_name();
+
+    session.ddl(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks)).await.unwrap();
+    session
+        .ddl(
+            format!(
+                "CREATE TABLE IF NOT EXISTS {}.t (a int PRIMARY KEY, b vector<int, 4>, c vector<text, 2>)",
+                ks
+            ),
+        )
+        .await
+        .unwrap();
+
+    let prepared_statement = session
+        .prepare(format!(
+            "INSERT INTO {}.t (a, b, c) VALUES (?, [11, 12, 13, 14], ['afoo', 'abar'])",
+            ks
+        ))
+        .await
+        .unwrap();
+    session
+        .execute_unpaged(&prepared_statement, &(2,))
+        .await
+        .unwrap();
+
+    // TODO: Implement and test SELECT statements and bind values (`?`)
 }

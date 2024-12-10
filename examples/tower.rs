@@ -1,3 +1,5 @@
+use scylla::frame::response::result::Row;
+use scylla::transport::session::Session;
 use std::env;
 use std::future::Future;
 use std::pin::Pin;
@@ -7,7 +9,7 @@ use std::task::Poll;
 use tower::Service;
 
 struct SessionService {
-    session: Arc<scylla::Session>,
+    session: Arc<Session>,
 }
 
 // A trivial service implementation for sending parameterless simple string requests to Scylla.
@@ -40,9 +42,10 @@ async fn main() -> anyhow::Result<()> {
         ),
     };
 
-    let resp = session
+    let rows_result = session
         .call("SELECT keyspace_name, table_name FROM system_schema.tables;".into())
-        .await?;
+        .await?
+        .into_rows_result()?;
 
     let print_text = |t: &Option<scylla::frame::response::result::CqlValue>| {
         t.as_ref()
@@ -56,14 +59,15 @@ async fn main() -> anyhow::Result<()> {
 
     println!(
         "Tables:\n{}",
-        resp.rows()?
-            .into_iter()
-            .map(|r| format!(
+        rows_result
+            .rows::<Row>()?
+            .map(|r| r.map(|r| format!(
                 "\t{}.{}",
                 print_text(&r.columns[0]),
                 print_text(&r.columns[1])
-            ))
-            .collect::<Vec<String>>()
+            )))
+            .collect::<Result<Vec<String>, _>>()
+            .unwrap()
             .join("\n")
     );
     Ok(())

@@ -1,7 +1,6 @@
 //! Iterators over rows returned by paged queries
 
 use std::future::Future;
-use std::mem;
 use std::net::SocketAddr;
 use std::ops::ControlFlow;
 use std::pin::Pin;
@@ -9,19 +8,27 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use futures::Stream;
+use scylla_cql::frame::frame_errors::ResultMetadataAndRowsCountParseError;
+use scylla_cql::frame::response::result::RawMetadataAndRawRows;
 use scylla_cql::frame::response::NonErrorResponse;
+use scylla_cql::types::deserialize::result::RawRowLendingIterator;
+use scylla_cql::types::deserialize::row::{ColumnIterator, DeserializeRow};
+use scylla_cql::types::deserialize::{DeserializationError, TypeCheckError};
 use scylla_cql::types::serialize::row::SerializedValues;
 use std::result::Result;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
 use super::execution_profile::ExecutionProfileInner;
+use super::query_result::ColumnSpecs;
 use super::session::RequestSpan;
+#[allow(deprecated)]
 use crate::cql_to_rust::{FromRow, FromRowError};
 
+use crate::deserialize::DeserializeOwnedRow;
 use crate::frame::response::{
     result,
-    result::{ColumnSpec, Row, Rows},
+    result::{ColumnSpec, Row},
 };
 use crate::history::{self, HistoryListener};
 use crate::statement::{prepared_statement::PreparedStatement, query::Query};
@@ -36,17 +43,22 @@ use crate::transport::NodeRef;
 use tracing::{trace, trace_span, warn, Instrument};
 use uuid::Uuid;
 
-/// Iterator over rows returned by paged queries\
-/// Allows to easily access rows without worrying about handling multiple pages
-pub struct RowIterator {
-    current_row_idx: usize,
-    current_page: Rows,
-    page_receiver: mpsc::Receiver<Result<ReceivedPage, QueryError>>,
-    tracing_ids: Vec<Uuid>,
+// Like std::task::ready!, but handles the whole stack of Poll<Option<Result<>>>.
+// If it matches Poll::Ready(Some(Ok(_))), then it returns the innermost value,
+// otherwise it returns from the surrounding function.
+macro_rules! ready_some_ok {
+    ($e:expr) => {
+        match $e {
+            Poll::Ready(Some(Ok(x))) => x,
+            Poll::Ready(Some(Err(err))) => return Poll::Ready(Some(Err(err.into()))),
+            Poll::Ready(None) => return Poll::Ready(None),
+            Poll::Pending => return Poll::Pending,
+        }
+    };
 }
 
 struct ReceivedPage {
-    rows: Rows,
+    rows: RawMetadataAndRawRows,
     tracing_id: Option<Uuid>,
 }
 
@@ -58,361 +70,11 @@ pub(crate) struct PreparedIteratorConfig {
     pub(crate) metrics: Arc<Metrics>,
 }
 
-/// Fetching pages is asynchronous so `RowIterator` does not implement the `Iterator` trait.\
-/// Instead it uses the asynchronous `Stream` trait
-impl Stream for RowIterator {
-    type Item = Result<Row, QueryError>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let mut s = self.as_mut();
-
-        if s.is_current_page_exhausted() {
-            match Pin::new(&mut s.page_receiver).poll_recv(cx) {
-                Poll::Ready(Some(Ok(received_page))) => {
-                    s.current_page = received_page.rows;
-                    s.current_row_idx = 0;
-
-                    if let Some(tracing_id) = received_page.tracing_id {
-                        s.tracing_ids.push(tracing_id);
-                    }
-                }
-                Poll::Ready(Some(Err(err))) => return Poll::Ready(Some(Err(err))),
-                Poll::Ready(None) => return Poll::Ready(None),
-                Poll::Pending => return Poll::Pending,
-            }
-        }
-
-        let idx = s.current_row_idx;
-        if idx < s.current_page.rows.len() {
-            let row = mem::take(&mut s.current_page.rows[idx]);
-            s.current_row_idx += 1;
-            return Poll::Ready(Some(Ok(row)));
-        }
-
-        // We probably got a zero-sized page
-        // Yield, but tell that we are ready
-        cx.waker().wake_by_ref();
-        Poll::Pending
-    }
-}
-
-impl RowIterator {
-    /// Converts this iterator into an iterator over rows parsed as given type
-    pub fn into_typed<RowT: FromRow>(self) -> TypedRowIterator<RowT> {
-        TypedRowIterator {
-            row_iterator: self,
-            phantom_data: Default::default(),
-        }
-    }
-
-    pub(crate) async fn new_for_query(
-        query: Query,
-        execution_profile: Arc<ExecutionProfileInner>,
-        cluster_data: Arc<ClusterData>,
-        metrics: Arc<Metrics>,
-    ) -> Result<RowIterator, QueryError> {
-        let (sender, receiver) = mpsc::channel(1);
-
-        let consistency = query
-            .config
-            .consistency
-            .unwrap_or(execution_profile.consistency);
-        let serial_consistency = query
-            .config
-            .serial_consistency
-            .unwrap_or(execution_profile.serial_consistency);
-
-        let page_size = query.get_validated_page_size();
-
-        let routing_info = RoutingInfo {
-            consistency,
-            serial_consistency,
-            ..Default::default()
-        };
-
-        let retry_session = query
-            .get_retry_policy()
-            .map(|rp| &**rp)
-            .unwrap_or(&*execution_profile.retry_policy)
-            .new_session();
-
-        let parent_span = tracing::Span::current();
-        let worker_task = async move {
-            let query_ref = &query;
-
-            let page_query = |connection: Arc<Connection>,
-                              consistency: Consistency,
-                              paging_state: PagingState| {
-                async move {
-                    connection
-                        .query_raw_with_consistency(
-                            query_ref,
-                            consistency,
-                            serial_consistency,
-                            Some(page_size),
-                            paging_state,
-                        )
-                        .await
-                }
-            };
-
-            let query_ref = &query;
-
-            let span_creator = move || {
-                let span = RequestSpan::new_query(&query_ref.contents);
-                span.record_request_size(0);
-                span
-            };
-
-            let worker = RowIteratorWorker {
-                sender: sender.into(),
-                page_query,
-                statement_info: routing_info,
-                query_is_idempotent: query.config.is_idempotent,
-                query_consistency: consistency,
-                retry_session,
-                execution_profile,
-                metrics,
-                paging_state: PagingState::start(),
-                history_listener: query.config.history_listener.clone(),
-                current_query_id: None,
-                current_attempt_id: None,
-                parent_span,
-                span_creator,
-            };
-
-            worker.work(cluster_data).await
-        };
-
-        Self::new_from_worker_future(worker_task, receiver).await
-    }
-
-    pub(crate) async fn new_for_prepared_statement(
-        config: PreparedIteratorConfig,
-    ) -> Result<RowIterator, QueryError> {
-        let (sender, receiver) = mpsc::channel(1);
-
-        let consistency = config
-            .prepared
-            .config
-            .consistency
-            .unwrap_or(config.execution_profile.consistency);
-        let serial_consistency = config
-            .prepared
-            .config
-            .serial_consistency
-            .unwrap_or(config.execution_profile.serial_consistency);
-
-        let page_size = config.prepared.get_validated_page_size();
-
-        let retry_session = config
-            .prepared
-            .get_retry_policy()
-            .map(|rp| &**rp)
-            .unwrap_or(&*config.execution_profile.retry_policy)
-            .new_session();
-
-        let parent_span = tracing::Span::current();
-        let worker_task = async move {
-            let prepared_ref = &config.prepared;
-            let values_ref = &config.values;
-
-            let (partition_key, token) = match prepared_ref
-                .extract_partition_key_and_calculate_token(
-                    prepared_ref.get_partitioner_name(),
-                    values_ref,
-                ) {
-                Ok(res) => res.unzip(),
-                Err(err) => {
-                    let (proof, _res) = ProvingSender::from(sender).send(Err(err)).await;
-                    return proof;
-                }
-            };
-
-            let table_spec = config.prepared.get_table_spec();
-            let statement_info = RoutingInfo {
-                consistency,
-                serial_consistency,
-                token,
-                table: table_spec,
-                is_confirmed_lwt: config.prepared.is_confirmed_lwt(),
-            };
-
-            let page_query = |connection: Arc<Connection>,
-                              consistency: Consistency,
-                              paging_state: PagingState| async move {
-                connection
-                    .execute_raw_with_consistency(
-                        prepared_ref,
-                        values_ref,
-                        consistency,
-                        serial_consistency,
-                        Some(page_size),
-                        paging_state,
-                    )
-                    .await
-            };
-
-            let serialized_values_size = config.values.buffer_size();
-
-            let replicas: Option<smallvec::SmallVec<[_; 8]>> =
-                if let (Some(table_spec), Some(token)) =
-                    (statement_info.table, statement_info.token)
-                {
-                    Some(
-                        config
-                            .cluster_data
-                            .get_token_endpoints_iter(table_spec, token)
-                            .map(|(node, shard)| (node.clone(), shard))
-                            .collect(),
-                    )
-                } else {
-                    None
-                };
-
-            let span_creator = move || {
-                let span = RequestSpan::new_prepared(
-                    partition_key.as_ref().map(|pk| pk.iter()),
-                    token,
-                    serialized_values_size,
-                );
-                if let Some(replicas) = replicas.as_ref() {
-                    span.record_replicas(replicas);
-                }
-                span
-            };
-
-            let worker = RowIteratorWorker {
-                sender: sender.into(),
-                page_query,
-                statement_info,
-                query_is_idempotent: config.prepared.config.is_idempotent,
-                query_consistency: consistency,
-                retry_session,
-                execution_profile: config.execution_profile,
-                metrics: config.metrics,
-                paging_state: PagingState::start(),
-                history_listener: config.prepared.config.history_listener.clone(),
-                current_query_id: None,
-                current_attempt_id: None,
-                parent_span,
-                span_creator,
-            };
-
-            worker.work(config.cluster_data).await
-        };
-
-        Self::new_from_worker_future(worker_task, receiver).await
-    }
-
-    pub(crate) async fn new_for_connection_query_iter(
-        query: Query,
-        connection: Arc<Connection>,
-        consistency: Consistency,
-        serial_consistency: Option<SerialConsistency>,
-    ) -> Result<RowIterator, QueryError> {
-        let (sender, receiver) = mpsc::channel::<Result<ReceivedPage, QueryError>>(1);
-
-        let page_size = query.get_validated_page_size();
-
-        let worker_task = async move {
-            let worker = SingleConnectionRowIteratorWorker {
-                sender: sender.into(),
-                fetcher: |paging_state| {
-                    connection.query_raw_with_consistency(
-                        &query,
-                        consistency,
-                        serial_consistency,
-                        Some(page_size),
-                        paging_state,
-                    )
-                },
-            };
-            worker.work().await
-        };
-
-        Self::new_from_worker_future(worker_task, receiver).await
-    }
-
-    pub(crate) async fn new_for_connection_execute_iter(
-        prepared: PreparedStatement,
-        values: SerializedValues,
-        connection: Arc<Connection>,
-        consistency: Consistency,
-        serial_consistency: Option<SerialConsistency>,
-    ) -> Result<RowIterator, QueryError> {
-        let (sender, receiver) = mpsc::channel::<Result<ReceivedPage, QueryError>>(1);
-
-        let page_size = prepared.get_validated_page_size();
-
-        let worker_task = async move {
-            let worker = SingleConnectionRowIteratorWorker {
-                sender: sender.into(),
-                fetcher: |paging_state| {
-                    connection.execute_raw_with_consistency(
-                        &prepared,
-                        &values,
-                        consistency,
-                        serial_consistency,
-                        Some(page_size),
-                        paging_state,
-                    )
-                },
-            };
-            worker.work().await
-        };
-
-        Self::new_from_worker_future(worker_task, receiver).await
-    }
-
-    async fn new_from_worker_future(
-        worker_task: impl Future<Output = PageSendAttemptedProof> + Send + 'static,
-        mut receiver: mpsc::Receiver<Result<ReceivedPage, QueryError>>,
-    ) -> Result<RowIterator, QueryError> {
-        tokio::task::spawn(worker_task);
-
-        // This unwrap is safe because:
-        // - The future returned by worker.work sends at least one item
-        //   to the channel (the PageSendAttemptedProof helps enforce this)
-        // - That future is polled in a tokio::task which isn't going to be
-        //   cancelled
-        let pages_received = receiver.recv().await.unwrap()?;
-
-        Ok(RowIterator {
-            current_row_idx: 0,
-            current_page: pages_received.rows,
-            page_receiver: receiver,
-            tracing_ids: if let Some(tracing_id) = pages_received.tracing_id {
-                vec![tracing_id]
-            } else {
-                Vec::new()
-            },
-        })
-    }
-
-    /// If tracing was enabled returns tracing ids of all finished page queries
-    pub fn get_tracing_ids(&self) -> &[Uuid] {
-        &self.tracing_ids
-    }
-
-    /// Returns specification of row columns
-    pub fn get_column_specs(&self) -> &[ColumnSpec<'static>] {
-        self.current_page.metadata.col_specs()
-    }
-
-    fn is_current_page_exhausted(&self) -> bool {
-        self.current_row_idx >= self.current_page.rows.len()
-    }
-}
-
 // A separate module is used here so that the parent module cannot construct
 // SendAttemptedProof directly.
 mod checked_channel_sender {
-    use scylla_cql::frame::{
-        request::query::PagingStateResponse,
-        response::result::{ResultMetadata, Rows},
-    };
-    use std::{marker::PhantomData, sync::Arc};
+    use scylla_cql::frame::response::result::RawMetadataAndRawRows;
+    use std::marker::PhantomData;
     use tokio::sync::mpsc;
     use uuid::Uuid;
 
@@ -454,13 +116,7 @@ mod checked_channel_sender {
             Result<(), mpsc::error::SendError<ResultPage>>,
         ) {
             let empty_page = ReceivedPage {
-                rows: Rows {
-                    metadata: Arc::new(ResultMetadata::mock_empty()),
-                    paging_state_response: PagingStateResponse::NoMorePages,
-                    rows_count: 0,
-                    rows: Vec::new(),
-                    serialized_size: 0,
-                },
+                rows: RawMetadataAndRawRows::mock_empty(),
                 tracing_id,
             };
             self.send(Ok(empty_page)).await
@@ -472,9 +128,9 @@ use checked_channel_sender::{ProvingSender, SendAttemptedProof};
 
 type PageSendAttemptedProof = SendAttemptedProof<Result<ReceivedPage, QueryError>>;
 
-// RowIteratorWorker works in the background to fetch pages
-// RowIterator receives them through a channel
-struct RowIteratorWorker<'a, QueryFunc, SpanCreatorFunc> {
+// PagerWorker works in the background to fetch pages
+// QueryPager receives them through a channel
+struct PagerWorker<'a, QueryFunc, SpanCreatorFunc> {
     sender: ProvingSender<Result<ReceivedPage, QueryError>>,
 
     // Closure used to perform a single page query
@@ -498,7 +154,7 @@ struct RowIteratorWorker<'a, QueryFunc, SpanCreatorFunc> {
     span_creator: SpanCreatorFunc,
 }
 
-impl<QueryFunc, QueryFut, SpanCreator> RowIteratorWorker<'_, QueryFunc, SpanCreator>
+impl<QueryFunc, QueryFut, SpanCreator> PagerWorker<'_, QueryFunc, SpanCreator>
 where
     QueryFunc: Fn(Arc<Connection>, Consistency, PagingState) -> QueryFut,
     QueryFut: Future<Output = Result<QueryResponse, UserRequestError>>,
@@ -605,7 +261,7 @@ where
             }
         }
 
-        // Send last_error to RowIterator - query failed fully
+        // Send last_error to QueryPager - query failed fully
         self.log_query_error(&last_error);
         let (proof, _) = self.sender.send(Err(last_error)).await;
         proof
@@ -662,7 +318,8 @@ where
 
         match query_response {
             Ok(NonErrorQueryResponse {
-                response: NonErrorResponse::Result(result::Result::Rows(mut rows)),
+                response:
+                    NonErrorResponse::Result(result::Result::Rows((rows, paging_state_response))),
                 tracing_id,
                 ..
             }) => {
@@ -673,16 +330,14 @@ where
                     .load_balancing_policy
                     .on_query_success(&self.statement_info, elapsed, node);
 
-                let paging_state_response = rows.paging_state_response.take();
-
-                request_span.record_rows_fields(&rows);
+                request_span.record_raw_rows_fields(&rows);
 
                 let received_page = ReceivedPage { rows, tracing_id };
 
-                // Send next page to RowIterator
+                // Send next page to QueryPager
                 let (proof, res) = self.sender.send(Ok(received_page)).await;
                 if res.is_err() {
-                    // channel was closed, RowIterator was dropped - should shutdown
+                    // channel was closed, QueryPager was dropped - should shutdown
                     return Ok(ControlFlow::Break(proof));
                 }
 
@@ -815,15 +470,15 @@ where
     }
 }
 
-/// A massively simplified version of the RowIteratorWorker. It does not have
+/// A massively simplified version of the PagerWorker. It does not have
 /// any complicated logic related to retries, it just fetches pages from
 /// a single connection.
-struct SingleConnectionRowIteratorWorker<Fetcher> {
+struct SingleConnectionPagerWorker<Fetcher> {
     sender: ProvingSender<Result<ReceivedPage, QueryError>>,
     fetcher: Fetcher,
 }
 
-impl<Fetcher, FetchFut> SingleConnectionRowIteratorWorker<Fetcher>
+impl<Fetcher, FetchFut> SingleConnectionPagerWorker<Fetcher>
 where
     Fetcher: Fn(PagingState) -> FetchFut + Send + Sync,
     FetchFut: Future<Output = Result<QueryResponse, UserRequestError>> + Send,
@@ -844,9 +499,7 @@ where
             let result = (self.fetcher)(paging_state).await?;
             let response = result.into_non_error_query_response()?;
             match response.response {
-                NonErrorResponse::Result(result::Result::Rows(mut rows)) => {
-                    let paging_state_response = rows.paging_state_response.take();
-
+                NonErrorResponse::Result(result::Result::Rows((rows, paging_state_response))) => {
                     let (proof, send_result) = self
                         .sender
                         .send(Ok(ReceivedPage {
@@ -856,7 +509,7 @@ where
                         .await;
 
                     if send_result.is_err() {
-                        // channel was closed, RowIterator was dropped - should shutdown
+                        // channel was closed, QueryPager was dropped - should shutdown
                         return Ok(proof);
                     }
 
@@ -889,61 +542,649 @@ where
     }
 }
 
-/// Iterator over rows returned by paged queries
-/// where each row is parsed as the given type\
-/// Returned by `RowIterator::into_typed`
-pub struct TypedRowIterator<RowT> {
-    row_iterator: RowIterator,
-    phantom_data: std::marker::PhantomData<RowT>,
+/// An intermediate object that allows to construct a stream over a query
+/// that is asynchronously paged in the background.
+///
+/// Before the results can be processed in a convenient way, the QueryPager
+/// needs to be cast into a typed stream. This is done by use of `rows_stream()` method.
+/// As the method is generic over the target type, the turbofish syntax
+/// can come in handy there, e.g. `query_pager.rows_stream::<(i32, String, Uuid)>()`.
+///
+/// A pre-0.15.0 interface is also available, although deprecated:
+/// `into_legacy()` method converts QueryPager to LegacyRowIterator,
+/// enabling Stream'ed operation on rows being eagerly deserialized
+/// to the middle-man [Row] type. This is inefficient, especially if
+/// [Row] is not the intended target type.
+pub struct QueryPager {
+    current_page: RawRowLendingIterator,
+    page_receiver: mpsc::Receiver<Result<ReceivedPage, QueryError>>,
+    tracing_ids: Vec<Uuid>,
 }
 
-impl<RowT> TypedRowIterator<RowT> {
+// QueryPager is not an iterator or a stream! However, it implements
+// a `next()` method that returns a [ColumnIterator], which can be used
+// to manually deserialize a row.
+// The `ColumnIterator` borrows from the `QueryPager`, and the [futures::Stream] trait
+// does not allow for such a pattern. Lending streams are not a thing yet.
+impl QueryPager {
+    /// Returns the next item (`ColumnIterator`) from the stream.
+    ///
+    /// This can be used with `type_check() for manual deserialization - see example below.
+    ///
+    /// This is not a part of the `Stream` interface because the returned iterator
+    /// borrows from self.
+    ///
+    /// This is cancel-safe.
+    async fn next(&mut self) -> Option<Result<ColumnIterator, QueryError>> {
+        let res = std::future::poll_fn(|cx| Pin::new(&mut *self).poll_fill_page(cx)).await;
+        match res {
+            Some(Ok(())) => {}
+            Some(Err(err)) => return Some(Err(err)),
+            None => return None,
+        }
+
+        // We are guaranteed here to have a non-empty page, so unwrap
+        Some(
+            self.current_page
+                .next()
+                .unwrap()
+                .map_err(|err| NextRowError::RowDeserializationError(err).into()),
+        )
+    }
+
+    /// Tries to acquire a non-empty page, if current page is exhausted.
+    fn poll_fill_page<'r>(
+        mut self: Pin<&'r mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<(), QueryError>>> {
+        if !self.is_current_page_exhausted() {
+            return Poll::Ready(Some(Ok(())));
+        }
+        ready_some_ok!(self.as_mut().poll_next_page(cx));
+        if self.is_current_page_exhausted() {
+            // We most likely got a zero-sized page.
+            // Try again later.
+            cx.waker().wake_by_ref();
+            Poll::Pending
+        } else {
+            Poll::Ready(Some(Ok(())))
+        }
+    }
+
+    /// Makes an attempt to acquire the next page (which may be empty).
+    ///
+    /// On success, returns Some(Ok()).
+    /// On failure, returns Some(Err()).
+    /// If there are no more pages, returns None.
+    fn poll_next_page<'r>(
+        mut self: Pin<&'r mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<(), QueryError>>> {
+        let mut s = self.as_mut();
+
+        let received_page = ready_some_ok!(Pin::new(&mut s.page_receiver).poll_recv(cx));
+
+        // TODO: see my other comment next to QueryError::NextRowError
+        // This is the place where conversion happens. To fix this, we need to refactor error types in iterator API.
+        // The `page_receiver`'s error type should be narrowed from QueryError to some other error type.
+        let raw_rows_with_deserialized_metadata =
+            received_page.rows.deserialize_metadata().map_err(|err| {
+                NextRowError::NextPageError(NextPageError::ResultMetadataParseError(err))
+            })?;
+        s.current_page = RawRowLendingIterator::new(raw_rows_with_deserialized_metadata);
+
+        if let Some(tracing_id) = received_page.tracing_id {
+            s.tracing_ids.push(tracing_id);
+        }
+
+        Poll::Ready(Some(Ok(())))
+    }
+
+    /// Type-checks the iterator against given type.
+    ///
+    /// This is automatically called upon transforming [QueryPager] into [TypedRowStream].
+    /// Can be used with `next()` for manual deserialization. See `next()` for an example.
+    #[inline]
+    pub fn type_check<'frame, 'metadata, RowT: DeserializeRow<'frame, 'metadata>>(
+        &self,
+    ) -> Result<(), TypeCheckError> {
+        RowT::type_check(self.column_specs().inner())
+    }
+
+    /// Casts the iterator to a given row type, enabling [Stream]'ed operations
+    /// on rows, which deserialize them on-the-fly to that given type.
+    /// It only allows deserializing owned types, because [Stream] is not lending.
+    /// Begins with performing type check.
+    #[inline]
+    pub fn rows_stream<RowT: 'static + for<'frame, 'metadata> DeserializeRow<'frame, 'metadata>>(
+        self,
+    ) -> Result<TypedRowStream<RowT>, TypeCheckError> {
+        TypedRowStream::<RowT>::new(self)
+    }
+
+    /// Converts this iterator into an iterator over rows parsed as given type,
+    /// using the legacy deserialization framework.
+    /// This is inefficient, because all rows are being eagerly deserialized
+    /// to a middle-man [Row] type.
+    #[deprecated(
+        since = "0.15.0",
+        note = "Legacy deserialization API is inefficient and is going to be removed soon"
+    )]
+    #[allow(deprecated)]
+    #[inline]
+    pub fn into_legacy(self) -> LegacyRowIterator {
+        LegacyRowIterator::new(self)
+    }
+
+    pub(crate) async fn new_for_query(
+        query: Query,
+        execution_profile: Arc<ExecutionProfileInner>,
+        cluster_data: Arc<ClusterData>,
+        metrics: Arc<Metrics>,
+    ) -> Result<Self, QueryError> {
+        let (sender, receiver) = mpsc::channel(1);
+
+        let consistency = query
+            .config
+            .consistency
+            .unwrap_or(execution_profile.consistency);
+        let serial_consistency = query
+            .config
+            .serial_consistency
+            .unwrap_or(execution_profile.serial_consistency);
+
+        let page_size = query.get_validated_page_size();
+
+        let routing_info = RoutingInfo {
+            consistency,
+            serial_consistency,
+            ..Default::default()
+        };
+
+        let retry_session = query
+            .get_retry_policy()
+            .map(|rp| &**rp)
+            .unwrap_or(&*execution_profile.retry_policy)
+            .new_session();
+
+        let parent_span = tracing::Span::current();
+        let worker_task = async move {
+            let query_ref = &query;
+
+            let page_query = |connection: Arc<Connection>,
+                              consistency: Consistency,
+                              paging_state: PagingState| {
+                async move {
+                    connection
+                        .query_raw_with_consistency(
+                            query_ref,
+                            consistency,
+                            serial_consistency,
+                            Some(page_size),
+                            paging_state,
+                        )
+                        .await
+                }
+            };
+
+            let query_ref = &query;
+
+            let span_creator = move || {
+                let span = RequestSpan::new_query(&query_ref.contents);
+                span.record_request_size(0);
+                span
+            };
+
+            let worker = PagerWorker {
+                sender: sender.into(),
+                page_query,
+                statement_info: routing_info,
+                query_is_idempotent: query.config.is_idempotent,
+                query_consistency: consistency,
+                retry_session,
+                execution_profile,
+                metrics,
+                paging_state: PagingState::start(),
+                history_listener: query.config.history_listener.clone(),
+                current_query_id: None,
+                current_attempt_id: None,
+                parent_span,
+                span_creator,
+            };
+
+            worker.work(cluster_data).await
+        };
+
+        Self::new_from_worker_future(worker_task, receiver).await
+    }
+
+    pub(crate) async fn new_for_prepared_statement(
+        config: PreparedIteratorConfig,
+    ) -> Result<Self, QueryError> {
+        let (sender, receiver) = mpsc::channel(1);
+
+        let consistency = config
+            .prepared
+            .config
+            .consistency
+            .unwrap_or(config.execution_profile.consistency);
+        let serial_consistency = config
+            .prepared
+            .config
+            .serial_consistency
+            .unwrap_or(config.execution_profile.serial_consistency);
+
+        let page_size = config.prepared.get_validated_page_size();
+
+        let retry_session = config
+            .prepared
+            .get_retry_policy()
+            .map(|rp| &**rp)
+            .unwrap_or(&*config.execution_profile.retry_policy)
+            .new_session();
+
+        let parent_span = tracing::Span::current();
+        let worker_task = async move {
+            let prepared_ref = &config.prepared;
+            let values_ref = &config.values;
+
+            let (partition_key, token) = match prepared_ref
+                .extract_partition_key_and_calculate_token(
+                    prepared_ref.get_partitioner_name(),
+                    values_ref,
+                ) {
+                Ok(res) => res.unzip(),
+                Err(err) => {
+                    let (proof, _res) = ProvingSender::from(sender).send(Err(err)).await;
+                    return proof;
+                }
+            };
+
+            let table_spec = config.prepared.get_table_spec();
+            let statement_info = RoutingInfo {
+                consistency,
+                serial_consistency,
+                token,
+                table: table_spec,
+                is_confirmed_lwt: config.prepared.is_confirmed_lwt(),
+            };
+
+            let page_query = |connection: Arc<Connection>,
+                              consistency: Consistency,
+                              paging_state: PagingState| async move {
+                connection
+                    .execute_raw_with_consistency(
+                        prepared_ref,
+                        values_ref,
+                        consistency,
+                        serial_consistency,
+                        Some(page_size),
+                        paging_state,
+                    )
+                    .await
+            };
+
+            let serialized_values_size = config.values.buffer_size();
+
+            let replicas: Option<smallvec::SmallVec<[_; 8]>> =
+                if let (Some(table_spec), Some(token)) =
+                    (statement_info.table, statement_info.token)
+                {
+                    Some(
+                        config
+                            .cluster_data
+                            .get_token_endpoints_iter(table_spec, token)
+                            .map(|(node, shard)| (node.clone(), shard))
+                            .collect(),
+                    )
+                } else {
+                    None
+                };
+
+            let span_creator = move || {
+                let span = RequestSpan::new_prepared(
+                    partition_key.as_ref().map(|pk| pk.iter()),
+                    token,
+                    serialized_values_size,
+                );
+                if let Some(replicas) = replicas.as_ref() {
+                    span.record_replicas(replicas);
+                }
+                span
+            };
+
+            let worker = PagerWorker {
+                sender: sender.into(),
+                page_query,
+                statement_info,
+                query_is_idempotent: config.prepared.config.is_idempotent,
+                query_consistency: consistency,
+                retry_session,
+                execution_profile: config.execution_profile,
+                metrics: config.metrics,
+                paging_state: PagingState::start(),
+                history_listener: config.prepared.config.history_listener.clone(),
+                current_query_id: None,
+                current_attempt_id: None,
+                parent_span,
+                span_creator,
+            };
+
+            worker.work(config.cluster_data).await
+        };
+
+        Self::new_from_worker_future(worker_task, receiver).await
+    }
+
+    pub(crate) async fn new_for_connection_query_iter(
+        query: Query,
+        connection: Arc<Connection>,
+        consistency: Consistency,
+        serial_consistency: Option<SerialConsistency>,
+    ) -> Result<Self, QueryError> {
+        let (sender, receiver) = mpsc::channel::<Result<ReceivedPage, QueryError>>(1);
+
+        let page_size = query.get_validated_page_size();
+
+        let worker_task = async move {
+            let worker = SingleConnectionPagerWorker {
+                sender: sender.into(),
+                fetcher: |paging_state| {
+                    connection.query_raw_with_consistency(
+                        &query,
+                        consistency,
+                        serial_consistency,
+                        Some(page_size),
+                        paging_state,
+                    )
+                },
+            };
+            worker.work().await
+        };
+
+        Self::new_from_worker_future(worker_task, receiver).await
+    }
+
+    pub(crate) async fn new_for_connection_execute_iter(
+        prepared: PreparedStatement,
+        values: SerializedValues,
+        connection: Arc<Connection>,
+        consistency: Consistency,
+        serial_consistency: Option<SerialConsistency>,
+    ) -> Result<Self, QueryError> {
+        let (sender, receiver) = mpsc::channel::<Result<ReceivedPage, QueryError>>(1);
+
+        let page_size = prepared.get_validated_page_size();
+
+        let worker_task = async move {
+            let worker = SingleConnectionPagerWorker {
+                sender: sender.into(),
+                fetcher: |paging_state| {
+                    connection.execute_raw_with_consistency(
+                        &prepared,
+                        &values,
+                        consistency,
+                        serial_consistency,
+                        Some(page_size),
+                        paging_state,
+                    )
+                },
+            };
+            worker.work().await
+        };
+
+        Self::new_from_worker_future(worker_task, receiver).await
+    }
+
+    async fn new_from_worker_future(
+        worker_task: impl Future<Output = PageSendAttemptedProof> + Send + 'static,
+        mut receiver: mpsc::Receiver<Result<ReceivedPage, QueryError>>,
+    ) -> Result<Self, QueryError> {
+        tokio::task::spawn(worker_task);
+
+        // This unwrap is safe because:
+        // - The future returned by worker.work sends at least one item
+        //   to the channel (the PageSendAttemptedProof helps enforce this)
+        // - That future is polled in a tokio::task which isn't going to be
+        //   cancelled
+        let page_received = receiver.recv().await.unwrap()?;
+        let raw_rows_with_deserialized_metadata =
+            page_received.rows.deserialize_metadata().map_err(|err| {
+                NextRowError::NextPageError(NextPageError::ResultMetadataParseError(err))
+            })?;
+
+        Ok(Self {
+            current_page: RawRowLendingIterator::new(raw_rows_with_deserialized_metadata),
+            page_receiver: receiver,
+            tracing_ids: if let Some(tracing_id) = page_received.tracing_id {
+                vec![tracing_id]
+            } else {
+                Vec::new()
+            },
+        })
+    }
+
     /// If tracing was enabled returns tracing ids of all finished page queries
-    pub fn get_tracing_ids(&self) -> &[Uuid] {
-        self.row_iterator.get_tracing_ids()
+    #[inline]
+    pub fn tracing_ids(&self) -> &[Uuid] {
+        &self.tracing_ids
     }
 
     /// Returns specification of row columns
-    pub fn get_column_specs(&self) -> &[ColumnSpec<'static>] {
-        self.row_iterator.get_column_specs()
+    #[inline]
+    pub fn column_specs(&self) -> ColumnSpecs<'_> {
+        ColumnSpecs::new(self.current_page.metadata().col_specs())
+    }
+
+    fn is_current_page_exhausted(&self) -> bool {
+        self.current_page.rows_remaining() == 0
     }
 }
 
-/// Couldn't get next typed row from the iterator
-#[derive(Error, Debug, Clone)]
-pub enum NextRowError {
-    /// Query to fetch next page has failed
-    #[error(transparent)]
-    QueryError(#[from] QueryError),
-
-    /// Parsing values in row as given types failed
-    #[error(transparent)]
-    FromRowError(#[from] FromRowError),
+/// Returned by [QueryPager::rows_stream].
+///
+/// Implements [Stream], but only permits deserialization of owned types.
+/// To use [Stream] API (only accessible for owned types), use [QueryPager::rows_stream].
+pub struct TypedRowStream<RowT: 'static> {
+    raw_row_lending_stream: QueryPager,
+    _phantom: std::marker::PhantomData<RowT>,
 }
 
-/// Fetching pages is asynchronous so `TypedRowIterator` does not implement the `Iterator` trait.\
-/// Instead it uses the asynchronous `Stream` trait
-impl<RowT: FromRow> Stream for TypedRowIterator<RowT> {
-    type Item = Result<RowT, NextRowError>;
+impl<RowT> Unpin for TypedRowStream<RowT> {}
+
+impl<RowT> TypedRowStream<RowT>
+where
+    RowT: for<'frame, 'metadata> DeserializeRow<'frame, 'metadata>,
+{
+    fn new(raw_stream: QueryPager) -> Result<Self, TypeCheckError> {
+        raw_stream.type_check::<RowT>()?;
+
+        Ok(Self {
+            raw_row_lending_stream: raw_stream,
+            _phantom: Default::default(),
+        })
+    }
+}
+
+impl<RowT> TypedRowStream<RowT> {
+    /// If tracing was enabled, returns tracing ids of all finished page queries.
+    #[inline]
+    pub fn tracing_ids(&self) -> &[Uuid] {
+        self.raw_row_lending_stream.tracing_ids()
+    }
+
+    /// Returns specification of row columns
+    #[inline]
+    pub fn column_specs(&self) -> ColumnSpecs {
+        self.raw_row_lending_stream.column_specs()
+    }
+}
+
+/// Stream implementation for TypedRowStream.
+///
+/// It only works with owned types! For example, &str is not supported.
+impl<RowT> Stream for TypedRowStream<RowT>
+where
+    RowT: DeserializeOwnedRow,
+{
+    type Item = Result<RowT, QueryError>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let mut s = self.as_mut();
-
-        let next_elem: Option<Result<Row, QueryError>> =
-            match Pin::new(&mut s.row_iterator).poll_next(cx) {
-                Poll::Ready(next_elem) => next_elem,
-                Poll::Pending => return Poll::Pending,
-            };
-
-        let next_ready: Option<Self::Item> = match next_elem {
-            Some(Ok(next_row)) => Some(RowT::from_row(next_row).map_err(|e| e.into())),
-            Some(Err(e)) => Some(Err(e.into())),
-            None => None,
+        let next_fut = async {
+            self.raw_row_lending_stream.next().await.map(|res| {
+                res.and_then(|column_iterator| {
+                    <RowT as DeserializeRow>::deserialize(column_iterator)
+                        .map_err(|err| NextRowError::RowDeserializationError(err).into())
+                })
+            })
         };
 
-        Poll::Ready(next_ready)
+        futures::pin_mut!(next_fut);
+        let value = ready_some_ok!(next_fut.poll(cx));
+        Poll::Ready(Some(Ok(value)))
     }
 }
 
-// TypedRowIterator can be moved freely for any RowT so it's Unpin
-impl<RowT> Unpin for TypedRowIterator<RowT> {}
+/// An error returned that occurred during next page fetch.
+#[derive(Error, Debug, Clone)]
+#[non_exhaustive]
+pub enum NextPageError {
+    /// Failed to deserialize result metadata associated with next page response.
+    #[error("Failed to deserialize result metadata associated with next page response: {0}")]
+    ResultMetadataParseError(#[from] ResultMetadataAndRowsCountParseError),
+    // TODO: This should also include a variant representing an error that occurred during
+    // query that fetches the next page. However, as of now, it would require that we include QueryError here.
+    // This would introduce a cyclic dependency: QueryError -> NextRowError -> NextPageError -> QueryError.
+}
+
+/// An error returned by async iterator API.
+#[derive(Error, Debug, Clone)]
+#[non_exhaustive]
+pub enum NextRowError {
+    /// Failed to fetch next page of result.
+    #[error("Failed to fetch next page of result: {0}")]
+    NextPageError(#[from] NextPageError),
+
+    /// An error occurred during row deserialization.
+    #[error("Row deserialization error: {0}")]
+    RowDeserializationError(#[from] DeserializationError),
+}
+
+mod legacy {
+    #![allow(deprecated)]
+    use super::*;
+
+    /// Iterator over rows returned by paged queries.
+    ///
+    /// Allows to easily access rows without worrying about handling multiple pages.
+    #[deprecated(
+        since = "0.15.0",
+        note = "Legacy deserialization API is inefficient and is going to be removed soon"
+    )]
+    pub struct LegacyRowIterator {
+        raw_stream: QueryPager,
+    }
+
+    impl Stream for LegacyRowIterator {
+        type Item = Result<Row, LegacyNextRowError>;
+
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            let mut s = self.as_mut();
+
+            let next_fut = s.raw_stream.next();
+            futures::pin_mut!(next_fut);
+
+            let next_column_iter = ready_some_ok!(next_fut.poll(cx));
+
+            let next_ready_row = Row::deserialize(next_column_iter)
+                .map_err(LegacyNextRowError::RowDeserializationError);
+
+            Poll::Ready(Some(next_ready_row))
+        }
+    }
+
+    impl LegacyRowIterator {
+        pub(super) fn new(raw_stream: QueryPager) -> Self {
+            Self { raw_stream }
+        }
+
+        /// If tracing was enabled returns tracing ids of all finished page queries
+        pub fn get_tracing_ids(&self) -> &[Uuid] {
+            self.raw_stream.tracing_ids()
+        }
+
+        /// Returns specification of row columns
+        pub fn get_column_specs(&self) -> &[ColumnSpec<'_>] {
+            self.raw_stream.column_specs().inner()
+        }
+
+        pub fn into_typed<RowT>(self) -> LegacyTypedRowIterator<RowT> {
+            LegacyTypedRowIterator {
+                row_iterator: self,
+                _phantom_data: Default::default(),
+            }
+        }
+    }
+
+    /// Iterator over rows returned by paged queries
+    /// where each row is parsed as the given type\
+    /// Returned by `RowIterator::into_typed`
+    #[deprecated(
+        since = "0.15.0",
+        note = "Legacy deserialization API is inefficient and is going to be removed soon"
+    )]
+    #[allow(deprecated)]
+    pub struct LegacyTypedRowIterator<RowT> {
+        row_iterator: LegacyRowIterator,
+        _phantom_data: std::marker::PhantomData<RowT>,
+    }
+
+    impl<RowT> LegacyTypedRowIterator<RowT> {
+        /// If tracing was enabled returns tracing ids of all finished page queries
+        #[inline]
+        pub fn get_tracing_ids(&self) -> &[Uuid] {
+            self.row_iterator.get_tracing_ids()
+        }
+
+        /// Returns specification of row columns
+        #[inline]
+        pub fn get_column_specs(&self) -> &[ColumnSpec<'_>] {
+            self.row_iterator.get_column_specs()
+        }
+    }
+
+    /// Couldn't get next typed row from the iterator
+    #[derive(Error, Debug, Clone)]
+    pub enum LegacyNextRowError {
+        /// Query to fetch next page has failed
+        #[error(transparent)]
+        QueryError(#[from] QueryError),
+
+        /// Parsing values in row as given types failed
+        #[error(transparent)]
+        FromRowError(#[from] FromRowError),
+
+        /// Row deserialization error
+        #[error("Row deserialization error: {0}")]
+        RowDeserializationError(#[from] DeserializationError),
+    }
+
+    /// Fetching pages is asynchronous so `LegacyTypedRowIterator` does not implement the `Iterator` trait.\
+    /// Instead it uses the asynchronous `Stream` trait
+    impl<RowT: FromRow> Stream for LegacyTypedRowIterator<RowT> {
+        type Item = Result<RowT, LegacyNextRowError>;
+
+        fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+            let mut s = self.as_mut();
+
+            let next_row = ready_some_ok!(Pin::new(&mut s.row_iterator).poll_next(cx));
+            let typed_row_res = RowT::from_row(next_row).map_err(|e| e.into());
+            Poll::Ready(Some(typed_row_res))
+        }
+    }
+
+    // LegacyTypedRowIterator can be moved freely for any RowT so it's Unpin
+    impl<RowT> Unpin for LegacyTypedRowIterator<RowT> {}
+}
+#[allow(deprecated)]
+pub use legacy::{LegacyNextRowError, LegacyRowIterator, LegacyTypedRowIterator};

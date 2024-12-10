@@ -286,7 +286,7 @@ impl SerializeRow for LegacySerializedValues {
     fallback_impl_contents!();
 }
 
-impl<'b> SerializeRow for Cow<'b, LegacySerializedValues> {
+impl SerializeRow for Cow<'_, LegacySerializedValues> {
     fallback_impl_contents!();
 }
 
@@ -867,8 +867,55 @@ impl<'a> Iterator for SerializedValuesIterator<'a> {
     }
 }
 
+mod doctests {
+
+    /// ```compile_fail
+    ///
+    /// #[derive(scylla_macros::SerializeRow)]
+    /// #[scylla(crate = scylla_cql, skip_name_checks)]
+    /// struct TestRow {}
+    /// ```
+    fn _test_struct_deserialization_name_check_skip_requires_enforce_order() {}
+
+    /// ```compile_fail
+    ///
+    /// #[derive(scylla_macros::SerializeRow)]
+    /// #[scylla(crate = scylla_cql, skip_name_checks)]
+    /// struct TestRow {
+    ///     #[scylla(rename = "b")]
+    ///     a: i32,
+    /// }
+    /// ```
+    fn _test_struct_deserialization_skip_name_check_conflicts_with_rename() {}
+
+    /// ```compile_fail
+    ///
+    /// #[derive(scylla_macros::SerializeRow)]
+    /// #[scylla(crate = scylla_cql)]
+    /// struct TestRow {
+    ///     #[scylla(rename = "b")]
+    ///     a: i32,
+    ///     b: String,
+    /// }
+    /// ```
+    fn _test_struct_deserialization_skip_rename_collision_with_field() {}
+
+    /// ```compile_fail
+    ///
+    /// #[derive(scylla_macros::SerializeRow)]
+    /// #[scylla(crate = scylla_cql)]
+    /// struct TestRow {
+    ///     #[scylla(rename = "c")]
+    ///     a: i32,
+    ///     #[scylla(rename = "c")]
+    ///     b: String,
+    /// }
+    /// ```
+    fn _test_struct_deserialization_rename_collision_with_another_rename() {}
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::borrow::Cow;
     use std::collections::BTreeMap;
 
@@ -990,7 +1037,7 @@ mod tests {
         assert_eq!(typed_data, erased_data);
     }
 
-    fn do_serialize<T: SerializeRow>(t: T, columns: &[ColumnSpec]) -> Vec<u8> {
+    pub(crate) fn do_serialize<T: SerializeRow>(t: T, columns: &[ColumnSpec]) -> Vec<u8> {
         let ctx = RowSerializationContext { columns };
         let mut ret = Vec::new();
         let mut builder = RowWriter::new(&mut ret);
@@ -1517,6 +1564,23 @@ mod tests {
             },
             &spec,
         );
+
+        assert_eq!(reference, row);
+    }
+
+    #[test]
+    fn test_row_serialization_with_not_rust_idents() {
+        #[derive(SerializeRow, Debug)]
+        #[scylla(crate = crate)]
+        struct RowWithTTL {
+            #[scylla(rename = "[ttl]")]
+            ttl: i32,
+        }
+
+        let spec = [col("[ttl]", ColumnType::Int)];
+
+        let reference = do_serialize((42i32,), &spec);
+        let row = do_serialize(RowWithTTL { ttl: 42 }, &spec);
 
         assert_eq!(reference, row);
     }

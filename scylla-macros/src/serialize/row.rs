@@ -5,7 +5,7 @@ use proc_macro::TokenStream;
 use proc_macro2::Span;
 use syn::parse_quote;
 
-use super::Flavor;
+use crate::Flavor;
 
 #[derive(FromAttributes)]
 #[darling(attributes(scylla))]
@@ -16,6 +16,10 @@ struct Attributes {
     #[darling(default)]
     flavor: Flavor,
 
+    // If true, then the type checking code won't verify the column names.
+    // Columns will be matched to struct fields based solely on the order.
+    //
+    // This annotation only works if `enforce_order` flavor is specified.
     #[darling(default)]
     skip_name_checks: bool,
 }
@@ -47,8 +51,12 @@ impl Field {
 #[derive(FromAttributes)]
 #[darling(attributes(scylla))]
 struct FieldAttributes {
+    // If set, then serializes from the column with this particular name
+    // instead of the Rust field name.
     rename: Option<String>,
 
+    // If true, then the field is not serialized at all, but simply ignored.
+    // All other attributes are ignored.
     #[darling(default)]
     skip: bool,
 }
@@ -94,6 +102,7 @@ pub(crate) fn derive_serialize_row(tokens_input: TokenStream) -> Result<syn::Ite
     let is_empty_item = gen.generate_is_empty();
 
     let res = parse_quote! {
+        #[automatically_derived]
         impl #impl_generics #implemented_trait for #struct_name #ty_generics #where_clause {
             #serialize_item
             #is_empty_item
@@ -186,7 +195,7 @@ struct ColumnSortingGenerator<'a> {
     ctx: &'a Context,
 }
 
-impl<'a> Generator for ColumnSortingGenerator<'a> {
+impl Generator for ColumnSortingGenerator<'_> {
     fn generate_serialize(&self) -> syn::TraitItemFn {
         // Need to:
         // - Check that all required columns are there and no more
@@ -215,7 +224,7 @@ impl<'a> Generator for ColumnSortingGenerator<'a> {
         statements.push(self.ctx.generate_mk_ser_err());
 
         // Generate a "visited" flag for each field
-        let visited_flag_names = rust_field_names
+        let visited_flag_names = rust_field_idents
             .iter()
             .map(|s| syn::Ident::new(&format!("visited_flag_{}", s), Span::call_site()))
             .collect::<Vec<_>>();
@@ -309,7 +318,7 @@ struct ColumnOrderedGenerator<'a> {
     ctx: &'a Context,
 }
 
-impl<'a> Generator for ColumnOrderedGenerator<'a> {
+impl Generator for ColumnOrderedGenerator<'_> {
     fn generate_serialize(&self) -> syn::TraitItemFn {
         let mut statements: Vec<syn::Stmt> = Vec::new();
 

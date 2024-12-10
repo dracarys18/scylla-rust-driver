@@ -46,9 +46,10 @@ use std::{
     net::{Ipv4Addr, Ipv6Addr},
 };
 
-use super::errors::{ProtocolError, UseKeyspaceProtocolError};
-use super::iterator::RowIterator;
+use super::errors::{ProtocolError, SchemaVersionFetchError, UseKeyspaceProtocolError};
+use super::iterator::QueryPager;
 use super::locator::tablets::{RawTablet, TabletParsingError};
+use super::query_result::QueryResult;
 use super::session::AddressTranslator;
 use super::topology::{PeerEndpoint, UntranslatedEndpoint, UntranslatedPeer};
 use super::NodeAddr;
@@ -69,7 +70,6 @@ use crate::routing::ShardInfo;
 use crate::statement::prepared_statement::PreparedStatement;
 use crate::statement::{Consistency, PageSize, PagingState, PagingStateResponse};
 use crate::transport::Compression;
-use crate::QueryResult;
 
 // Queries for schema agreement
 const LOCAL_VERSION: &str = "SELECT schema_version FROM system.local WHERE key='local'";
@@ -193,7 +193,7 @@ impl<'a> OrphanhoodNotifier<'a> {
     }
 }
 
-impl<'a> Drop for OrphanhoodNotifier<'a> {
+impl Drop for OrphanhoodNotifier<'_> {
     fn drop(&mut self) {
         if self.enabled {
             let _ = self.notification_sender.send(self.request_id);
@@ -217,7 +217,7 @@ pub(crate) struct QueryResponse {
     pub(crate) tracing_id: Option<Uuid>,
     pub(crate) warnings: Vec<String>,
     #[allow(dead_code)] // This is not exposed to user (yet?)
-    pub(crate) custom_payload: Option<HashMap<String, Vec<u8>>>,
+    pub(crate) custom_payload: Option<HashMap<String, Bytes>>,
 }
 
 // A QueryResponse in which response can not be Response::Error
@@ -268,14 +268,11 @@ impl NonErrorQueryResponse {
     pub(crate) fn into_query_result_and_paging_state(
         self,
     ) -> Result<(QueryResult, PagingStateResponse), UserRequestError> {
-        let (rows, paging_state, metadata, serialized_size) = match self.response {
-            NonErrorResponse::Result(result::Result::Rows(rs)) => (
-                Some(rs.rows),
-                rs.paging_state_response,
-                Some(rs.metadata),
-                rs.serialized_size,
-            ),
-            NonErrorResponse::Result(_) => (None, PagingStateResponse::NoMorePages, None, 0),
+        let (raw_rows, paging_state_response) = match self.response {
+            NonErrorResponse::Result(result::Result::Rows((rs, paging_state_response))) => {
+                (Some(rs), paging_state_response)
+            }
+            NonErrorResponse::Result(_) => (None, PagingStateResponse::NoMorePages),
             _ => {
                 return Err(UserRequestError::UnexpectedResponse(
                     self.response.to_response_kind(),
@@ -284,14 +281,8 @@ impl NonErrorQueryResponse {
         };
 
         Ok((
-            QueryResult {
-                rows,
-                warnings: self.warnings,
-                tracing_id: self.tracing_id,
-                metadata,
-                serialized_size,
-            },
-            paging_state,
+            QueryResult::new(raw_rows, self.tracing_id, self.warnings),
+            paging_state_response,
         ))
     }
 
@@ -1191,13 +1182,13 @@ impl Connection {
     pub(crate) async fn query_iter(
         self: Arc<Self>,
         query: Query,
-    ) -> Result<RowIterator, QueryError> {
+    ) -> Result<QueryPager, QueryError> {
         let consistency = query
             .config
             .determine_consistency(self.config.default_consistency);
         let serial_consistency = query.config.serial_consistency.flatten();
 
-        RowIterator::new_for_connection_query_iter(query, self, consistency, serial_consistency)
+        QueryPager::new_for_connection_query_iter(query, self, consistency, serial_consistency)
             .await
     }
 
@@ -1207,13 +1198,13 @@ impl Connection {
         self: Arc<Self>,
         prepared_statement: PreparedStatement,
         values: SerializedValues,
-    ) -> Result<RowIterator, QueryError> {
+    ) -> Result<QueryPager, QueryError> {
         let consistency = prepared_statement
             .config
             .determine_consistency(self.config.default_consistency);
         let serial_consistency = prepared_statement.config.serial_consistency.flatten();
 
-        RowIterator::new_for_connection_execute_iter(
+        QueryPager::new_for_connection_execute_iter(
             prepared_statement,
             values,
             self,
@@ -1443,8 +1434,17 @@ impl Connection {
         let (version_id,) = self
             .query_unpaged(LOCAL_VERSION)
             .await?
-            .single_row_typed()
-            .map_err(ProtocolError::SchemaVersionFetch)?;
+            .into_rows_result()
+            .map_err(|err| {
+                QueryError::ProtocolError(ProtocolError::SchemaVersionFetch(
+                    SchemaVersionFetchError::TracesEventsIntoRowsResultError(err),
+                ))
+            })?
+            .single_row::<(Uuid,)>()
+            .map_err(|err| {
+                ProtocolError::SchemaVersionFetch(SchemaVersionFetchError::SingleRowError(err))
+            })?;
+
         Ok(version_id)
     }
 
@@ -2397,7 +2397,7 @@ mod tests {
     use crate::transport::connection::open_connection;
     use crate::transport::node::ResolvedContactPoint;
     use crate::transport::topology::UntranslatedEndpoint;
-    use crate::utils::test_utils::unique_keyspace_name;
+    use crate::utils::test_utils::{unique_keyspace_name, PerformDDL};
     use crate::SessionBuilder;
     use futures::{StreamExt, TryStreamExt};
     use std::collections::HashMap;
@@ -2452,17 +2452,14 @@ mod tests {
                 .build()
                 .await
                 .unwrap();
-            session.query_unpaged(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks.clone()), &[]).await.unwrap();
+            session.ddl(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks.clone())).await.unwrap();
             session.use_keyspace(ks.clone(), false).await.unwrap();
             session
-                .query_unpaged("DROP TABLE IF EXISTS connection_query_iter_tab", &[])
+                .ddl("DROP TABLE IF EXISTS connection_query_iter_tab")
                 .await
                 .unwrap();
             session
-                .query_unpaged(
-                    "CREATE TABLE IF NOT EXISTS connection_query_iter_tab (p int primary key)",
-                    &[],
-                )
+                .ddl("CREATE TABLE IF NOT EXISTS connection_query_iter_tab (p int primary key)")
                 .await
                 .unwrap();
         }
@@ -2478,6 +2475,8 @@ mod tests {
             .clone()
             .query_iter(select_query.clone())
             .await
+            .unwrap()
+            .rows_stream::<(i32,)>()
             .unwrap()
             .try_collect::<Vec<_>>()
             .await
@@ -2503,7 +2502,8 @@ mod tests {
             .query_iter(select_query.clone())
             .await
             .unwrap()
-            .into_typed::<(i32,)>()
+            .rows_stream::<(i32,)>()
+            .unwrap()
             .map(|ret| ret.unwrap().0)
             .collect::<Vec<_>>()
             .await;
@@ -2516,6 +2516,8 @@ mod tests {
                 "INSERT INTO connection_query_iter_tab (p) VALUES (0)",
             ))
             .await
+            .unwrap()
+            .rows_stream::<()>()
             .unwrap()
             .try_collect::<Vec<_>>()
             .await
@@ -2543,13 +2545,10 @@ mod tests {
                 .build()
                 .await
                 .unwrap();
-            session.query_unpaged(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks.clone()), &[]).await.unwrap();
+            session.ddl(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks.clone())).await.unwrap();
             session.use_keyspace(ks.clone(), false).await.unwrap();
             session
-                .query_unpaged(
-                    "CREATE TABLE IF NOT EXISTS t (p int primary key, v blob)",
-                    &[],
-                )
+                .ddl("CREATE TABLE IF NOT EXISTS t (p int primary key, v blob)")
                 .await
                 .unwrap();
         }
@@ -2575,7 +2574,7 @@ mod tests {
                 .await
                 .unwrap();
 
-            connection.query_unpaged("TRUNCATE t").await.unwrap();
+            connection.ddl("TRUNCATE t").await.unwrap();
 
             let mut futs = Vec::new();
 
@@ -2615,7 +2614,9 @@ mod tests {
                 .query_unpaged("SELECT p, v FROM t")
                 .await
                 .unwrap()
-                .rows_typed::<(i32, Vec<u8>)>()
+                .into_rows_result()
+                .unwrap()
+                .rows::<(i32, Vec<u8>)>()
                 .unwrap()
                 .collect::<Result<Vec<_>, _>>()
                 .unwrap();

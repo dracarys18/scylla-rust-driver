@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
-use crate::utils::setup_tracing;
-use crate::utils::test_with_3_node_cluster;
+use crate::utils::{
+    scylla_supports_tablets, setup_tracing, test_with_3_node_cluster, unique_keyspace_name,
+    PerformDDL,
+};
 
 use futures::future::try_join_all;
 use futures::TryStreamExt;
@@ -12,13 +14,10 @@ use scylla::load_balancing::RoutingInfo;
 use scylla::prepared_statement::PreparedStatement;
 use scylla::query::Query;
 use scylla::serialize::row::SerializeRow;
-use scylla::test_utils::unique_keyspace_name;
 use scylla::transport::ClusterData;
 use scylla::transport::Node;
 use scylla::transport::NodeRef;
-use scylla::ExecutionProfile;
-use scylla::QueryResult;
-use scylla::Session;
+use scylla::{ExecutionProfile, QueryResult, Session};
 
 use scylla::transport::errors::QueryError;
 use scylla_proxy::{
@@ -30,7 +29,7 @@ use tokio::sync::mpsc;
 use tracing::info;
 use uuid::Uuid;
 
-#[derive(scylla::FromRow)]
+#[derive(scylla::DeserializeRow)]
 struct SelectedTablet {
     last_token: i64,
     replicas: Vec<(Uuid, i32)>,
@@ -57,8 +56,10 @@ async fn get_tablets(session: &Session, ks: &str, table: &str) -> Vec<Tablet> {
         "select last_token, replicas from system.tablets WHERE keyspace_name = ? and table_name = ? ALLOW FILTERING",
         &(ks, table)).await.unwrap();
 
-    let mut selected_tablets = selected_tablets_response
-        .into_typed::<SelectedTablet>()
+    let mut selected_tablets: Vec<SelectedTablet> = selected_tablets_response
+        .rows_stream::<SelectedTablet>()
+        .unwrap()
+        .into_stream()
         .try_collect::<Vec<_>>()
         .await
         .unwrap();
@@ -251,25 +252,19 @@ fn count_tablet_feedbacks(
 
 async fn prepare_schema(session: &Session, ks: &str, table: &str, tablet_count: usize) {
     session
-        .query_unpaged(
-            format!(
-                "CREATE KEYSPACE IF NOT EXISTS {} 
+        .ddl(format!(
+            "CREATE KEYSPACE IF NOT EXISTS {} 
             WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 2}}
             AND tablets = {{ 'initial': {} }}",
-                ks, tablet_count
-            ),
-            &[],
-        )
+            ks, tablet_count
+        ))
         .await
         .unwrap();
     session
-        .query_unpaged(
-            format!(
-                "CREATE TABLE IF NOT EXISTS {}.{} (a int, b int, c text, primary key (a, b))",
-                ks, table
-            ),
-            &[],
-        )
+        .ddl(format!(
+            "CREATE TABLE IF NOT EXISTS {}.{} (a int, b int, c text, primary key (a, b))",
+            ks, table
+        ))
         .await
         .unwrap();
 }
@@ -300,7 +295,7 @@ async fn test_default_policy_is_tablet_aware() {
                 .await
                 .unwrap();
 
-            if !scylla::test_utils::scylla_supports_tablets(&session).await {
+            if !scylla_supports_tablets(&session).await {
                 tracing::warn!("Skipping test because this Scylla version doesn't support tablets");
                 return running_proxy;
             }
@@ -431,7 +426,7 @@ async fn test_tablet_feedback_not_sent_for_unprepared_queries() {
                 .await
                 .unwrap();
 
-            if !scylla::test_utils::scylla_supports_tablets(&session).await {
+            if !scylla_supports_tablets(&session).await {
                 tracing::warn!("Skipping test because this Scylla version doesn't support tablets");
                 return running_proxy;
             }
@@ -503,7 +498,7 @@ async fn test_lwt_optimization_works_with_tablets() {
                 .await
                 .unwrap();
 
-            if !scylla::test_utils::scylla_supports_tablets(&session).await {
+            if !scylla_supports_tablets(&session).await {
                 tracing::warn!("Skipping test because this Scylla version doesn't support tablets");
                 return running_proxy;
             }

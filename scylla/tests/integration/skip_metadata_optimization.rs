@@ -1,7 +1,6 @@
-use crate::utils::{setup_tracing, test_with_3_node_cluster};
-use scylla::transport::session::Session;
-use scylla::SessionBuilder;
-use scylla::{prepared_statement::PreparedStatement, test_utils::unique_keyspace_name};
+use crate::utils::{setup_tracing, test_with_3_node_cluster, unique_keyspace_name, PerformDDL};
+use scylla::prepared_statement::PreparedStatement;
+use scylla::{Session, SessionBuilder};
 use scylla_cql::frame::request::query::{PagingState, PagingStateResponse};
 use scylla_cql::frame::types;
 use scylla_proxy::{
@@ -28,10 +27,10 @@ async fn test_skip_result_metadata() {
             .unwrap();
 
         let ks = unique_keyspace_name();
-        session.query_unpaged(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 3}}", ks), &[]).await.unwrap();
+        session.ddl(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 3}}", ks)).await.unwrap();
         session.use_keyspace(ks, false).await.unwrap();
         session
-            .query_unpaged("CREATE TABLE t (a int primary key, b int, c text)", &[])
+            .ddl("CREATE TABLE t (a int primary key, b int, c text)")
             .await
             .unwrap();
         session.query_unpaged("INSERT INTO t (a, b, c) VALUES (1, 2, 'foo_filter_data')", &[]).await.unwrap();
@@ -83,14 +82,13 @@ async fn test_skip_result_metadata() {
         {
             let ks = unique_keyspace_name();
 
-            session.query_unpaged(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks), &[]).await.unwrap();
+            session.ddl(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks)).await.unwrap();
             session.use_keyspace(ks, true).await.unwrap();
 
             type RowT = (i32, i32, String);
             session
-                .query_unpaged(
+                .ddl(
                     "CREATE TABLE IF NOT EXISTS t2 (a int, b int, c text, primary key (a, b))",
-                    &[],
                 )
                 .await
                 .unwrap();
@@ -114,7 +112,9 @@ async fn test_skip_result_metadata() {
                     .query_unpaged(select_query, ())
                     .await
                     .unwrap()
-                    .rows_typed::<RowT>()
+                    .into_rows_result()
+                    .unwrap()
+                    .rows::<RowT>()
                     .unwrap()
                     .collect::<Result<Vec<_>, _>>()
                     .unwrap();
@@ -130,8 +130,13 @@ async fn test_skip_result_metadata() {
                         .execute_single_page(&prepared_paged, &[], paging_state)
                         .await
                         .unwrap();
-                    results_from_manual_paging
-                        .extend(rs_manual.rows_typed::<RowT>().unwrap().map(Result::unwrap));
+                    results_from_manual_paging.extend(
+                        rs_manual.into_rows_result()
+                            .unwrap()
+                            .rows::<RowT>()
+                            .unwrap()
+                            .map(Result::unwrap)
+                    );
 
                     match paging_state_response {
                         PagingStateResponse::HasMorePages { state } => {

@@ -1505,8 +1505,105 @@ pub enum ValueToSerializeValueAdapterError {
     },
 }
 
+mod doctests {
+    /// ```compile_fail
+    ///
+    /// #[derive(scylla_macros::SerializeValue)]
+    /// #[scylla(crate = scylla_cql, skip_name_checks)]
+    /// struct TestUdt {}
+    /// ```
+    fn _test_udt_bad_attributes_skip_name_check_requires_enforce_order() {}
+
+    /// ```compile_fail
+    ///
+    /// #[derive(scylla_macros::SerializeValue)]
+    /// #[scylla(crate = scylla_cql, flavor = "enforce_order", skip_name_checks)]
+    /// struct TestUdt {
+    ///     #[scylla(rename = "b")]
+    ///     a: i32,
+    /// }
+    /// ```
+    fn _test_udt_bad_attributes_skip_name_check_conflicts_with_rename() {}
+
+    /// ```compile_fail
+    ///
+    /// #[derive(scylla_macros::SerializeValue)]
+    /// #[scylla(crate = scylla_cql)]
+    /// struct TestUdt {
+    ///     #[scylla(rename = "b")]
+    ///     a: i32,
+    ///     b: String,
+    /// }
+    /// ```
+    fn _test_udt_bad_attributes_rename_collision_with_field() {}
+
+    /// ```compile_fail
+    ///
+    /// #[derive(scylla_macros::SerializeValue)]
+    /// #[scylla(crate = scylla_cql)]
+    /// struct TestUdt {
+    ///     #[scylla(rename = "c")]
+    ///     a: i32,
+    ///     #[scylla(rename = "c")]
+    ///     b: String,
+    /// }
+    /// ```
+    fn _test_udt_bad_attributes_rename_collision_with_another_rename() {}
+
+    /// ```compile_fail
+    ///
+    /// #[derive(scylla_macros::SerializeValue)]
+    /// #[scylla(crate = scylla_cql, flavor = "enforce_order", skip_name_checks)]
+    /// struct TestUdt {
+    ///     a: i32,
+    ///     #[scylla(allow_missing)]
+    ///     b: bool,
+    ///     c: String,
+    /// }
+    /// ```
+    fn _test_udt_bad_attributes_name_skip_name_checks_limitations_on_allow_missing() {}
+
+    /// ```
+    ///
+    /// #[derive(scylla_macros::SerializeValue)]
+    /// #[scylla(crate = scylla_cql, flavor = "enforce_order", skip_name_checks)]
+    /// struct TestUdt {
+    ///     a: i32,
+    ///     #[scylla(allow_missing)]
+    ///     b: bool,
+    ///     #[scylla(allow_missing)]
+    ///     c: String,
+    /// }
+    /// ```
+    fn _test_udt_good_attributes_name_skip_name_checks_limitations_on_allow_missing() {}
+
+    /// ```
+    /// #[derive(scylla_macros::SerializeValue)]
+    /// #[scylla(crate = scylla_cql)]
+    /// struct TestUdt {
+    ///     a: i32,
+    ///     #[scylla(allow_missing)]
+    ///     b: bool,
+    ///     c: String,
+    /// }
+    /// ```
+    fn _test_udt_unordered_flavour_no_limitations_on_allow_missing() {}
+
+    /// ```
+    /// #[derive(scylla_macros::SerializeValue)]
+    /// #[scylla(crate = scylla_cql)]
+    /// struct TestUdt {
+    ///     a: i32,
+    ///     #[scylla(default_when_null)]
+    ///     b: bool,
+    ///     c: String,
+    /// }
+    /// ```
+    fn _test_udt_default_when_null_is_accepted() {}
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::BTreeMap;
 
     use crate::frame::response::result::{ColumnType, CqlValue};
@@ -1566,7 +1663,7 @@ mod tests {
         t.serialize(typ, writer).map(|_| ()).map(|()| ret)
     }
 
-    fn do_serialize<T: SerializeValue>(t: T, typ: &ColumnType) -> Vec<u8> {
+    pub(crate) fn do_serialize<T: SerializeValue>(t: T, typ: &ColumnType) -> Vec<u8> {
         do_serialize_result(t, typ).unwrap()
     }
 
@@ -2600,7 +2697,7 @@ mod tests {
     }
 
     #[derive(SerializeValue, Debug, PartialEq, Eq, Default)]
-    #[scylla(crate = crate, force_exact_match)]
+    #[scylla(crate = crate, forbid_excess_udt_fields)]
     struct TestStrictUdtWithFieldSorting {
         a: String,
         b: i32,
@@ -2656,7 +2753,7 @@ mod tests {
     }
 
     #[derive(SerializeValue, Debug, PartialEq, Eq, Default)]
-    #[scylla(crate = crate, flavor = "enforce_order", force_exact_match)]
+    #[scylla(crate = crate, flavor = "enforce_order", forbid_excess_udt_fields)]
     struct TestStrictUdtWithEnforcedOrder {
         a: String,
         b: i32,
@@ -2735,5 +2832,33 @@ mod tests {
         );
 
         assert_eq!(reference, row);
+    }
+
+    #[test]
+    fn test_udt_with_non_rust_ident() {
+        #[derive(SerializeValue, Debug)]
+        #[scylla(crate = crate)]
+        struct UdtWithNonRustIdent {
+            #[scylla(rename = "a$a")]
+            a: i32,
+        }
+
+        let typ = ColumnType::UserDefinedType {
+            type_name: "typ".into(),
+            keyspace: "ks".into(),
+            field_types: vec![("a$a".into(), ColumnType::Int)],
+        };
+        let value = UdtWithNonRustIdent { a: 42 };
+
+        let mut reference = Vec::new();
+        // Total length of the struct
+        reference.extend_from_slice(&8i32.to_be_bytes());
+        // Field 'a'
+        reference.extend_from_slice(&(std::mem::size_of_val(&value.a) as i32).to_be_bytes());
+        reference.extend_from_slice(&value.a.to_be_bytes());
+
+        let udt = do_serialize(value, &typ);
+
+        assert_eq!(reference, udt);
     }
 }

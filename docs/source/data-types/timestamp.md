@@ -33,7 +33,7 @@ session
 // Read timestamp from the table
 let mut iter = session.query_iter("SELECT a FROM keyspace.table", &[])
     .await?
-    .into_typed::<(CqlTimestamp,)>();
+    .rows_stream::<(CqlTimestamp,)>()?;
 while let Some((value,)) = iter.try_next().await? {
     // ...
 }
@@ -43,7 +43,7 @@ while let Some((value,)) = iter.try_next().await? {
 
 ## chrono::DateTime
 
-If full value range is not required, `chrono` feature can be used to enable support of
+If the full value range is not required, the `chrono-04` feature can be used to enable support of
 [`chrono::DateTime`](https://docs.rs/chrono/0.4/chrono/struct.DateTime.html). All values are expected to be converted
 to UTC timezone explicitly, as [timestamp](https://docs.scylladb.com/stable/cql/types.html#timestamps) doesn't store
 timezone information. Any precision finer than 1ms will be lost.
@@ -73,7 +73,7 @@ session
 // Read timestamp from the table
 let mut iter = session.query_iter("SELECT a FROM keyspace.table", &[])
     .await?
-    .into_typed::<(DateTime<Utc>,)>();
+    .rows_stream::<(DateTime<Utc>,)>()?;
 while let Some((timestamp_value,)) = iter.try_next().await? {
     println!("{:?}", timestamp_value);
 }
@@ -83,7 +83,7 @@ while let Some((timestamp_value,)) = iter.try_next().await? {
 
 ## time::OffsetDateTime
 
-Alternatively, `time` feature can be used to enable support of
+Alternatively, the `time-03` feature can be used to enable support of
 [`time::OffsetDateTime`](https://docs.rs/time/0.3/time/struct.OffsetDateTime.html). As
 [timestamp](https://docs.scylladb.com/stable/cql/types.html#timestamps) doesn't support timezone information, time will
 be corrected to UTC and timezone info will be erased on write. On read, UTC timestamp is returned. Any precision finer
@@ -114,7 +114,7 @@ session
 // Read timestamp from the table
 let mut iter = session.query_iter("SELECT a FROM keyspace.table", &[])
     .await?
-    .into_typed::<(OffsetDateTime,)>();
+    .rows_stream::<(OffsetDateTime,)>()?;
 while let Some((timestamp_value,)) = iter.try_next().await? {
     println!("{:?}", timestamp_value);
 }

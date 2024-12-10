@@ -2,7 +2,11 @@
 
 use super::connection::SelfIdentity;
 use super::execution_profile::ExecutionProfileHandle;
-use super::session::{AddressTranslator, Session, SessionConfig};
+#[allow(deprecated)]
+use super::session::{
+    AddressTranslator, CurrentDeserializationApi, GenericSession, LegacyDeserializationApi,
+    SessionConfig,
+};
 use super::Compression;
 
 #[cfg(feature = "cloud")]
@@ -96,7 +100,10 @@ impl GenericSessionBuilder<DefaultMode> {
     /// ```
     /// # use scylla::{Session, SessionBuilder};
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let session: Session = SessionBuilder::new().known_node("127.0.0.1:9042").build().await?;
+    /// let session: Session = SessionBuilder::new()
+    ///     .known_node("127.0.0.1:9042")
+    ///     .build()
+    ///     .await?;
     /// # Ok(())
     /// # }
     /// ```
@@ -104,7 +111,10 @@ impl GenericSessionBuilder<DefaultMode> {
     /// ```
     /// # use scylla::{Session, SessionBuilder};
     /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
-    /// let session: Session = SessionBuilder::new().known_node("db1.example.com").build().await?;
+    /// let session: Session = SessionBuilder::new()
+    ///     .known_node("db1.example.com")
+    ///     .build()
+    ///     .await?;
     /// # Ok(())
     /// # }
     /// ```
@@ -493,7 +503,7 @@ impl<K: SessionBuilderKind> GenericSessionBuilder<K> {
 
     /// Set keyspace to be used on all connections.\
     /// Each connection will send `"USE <keyspace_name>"` before sending any requests.\
-    /// This can be later changed with [`Session::use_keyspace`]
+    /// This can be later changed with [`crate::Session::use_keyspace`]
     ///
     /// # Example
     /// ```
@@ -514,7 +524,39 @@ impl<K: SessionBuilderKind> GenericSessionBuilder<K> {
         self
     }
 
-    /// Builds the Session after setting all the options
+    /// Builds the Session after setting all the options.
+    ///
+    /// The new session object uses the legacy deserialization API. If you wish
+    /// to use the new API, use [`SessionBuilder::build`].
+    ///
+    /// # Example
+    /// ```
+    /// # use scylla::{LegacySession, SessionBuilder};
+    /// # use scylla::transport::Compression;
+    /// # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+    /// let session: LegacySession = SessionBuilder::new()
+    ///     .known_node("127.0.0.1:9042")
+    ///     .compression(Some(Compression::Snappy))
+    ///     .build_legacy() // Turns SessionBuilder into LegacySession
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[deprecated(
+        since = "0.15.0",
+        note = "Legacy deserialization API is inefficient and is going to be removed soon"
+    )]
+    #[allow(deprecated)]
+    pub async fn build_legacy(
+        &self,
+    ) -> Result<GenericSession<LegacyDeserializationApi>, NewSessionError> {
+        GenericSession::connect(self.config.clone()).await
+    }
+
+    /// Builds the Session after setting all the options.
+    ///
+    /// The new session object uses the new deserialization API. If you wish
+    /// to use the old API, use [`SessionBuilder::build`].
     ///
     /// # Example
     /// ```
@@ -529,8 +571,10 @@ impl<K: SessionBuilderKind> GenericSessionBuilder<K> {
     /// # Ok(())
     /// # }
     /// ```
-    pub async fn build(&self) -> Result<Session, NewSessionError> {
-        Session::connect(self.config.clone()).await
+    pub async fn build(
+        &self,
+    ) -> Result<GenericSession<CurrentDeserializationApi>, NewSessionError> {
+        GenericSession::connect(self.config.clone()).await
     }
 
     /// Changes connection timeout
@@ -815,7 +859,7 @@ impl<K: SessionBuilderKind> GenericSessionBuilder<K> {
     }
 
     /// Set the number of attempts to fetch [TracingInfo](crate::tracing::TracingInfo)
-    /// in [`Session::get_tracing_info`].
+    /// in [`Session::get_tracing_info`](crate::Session::get_tracing_info).
     /// The default is 5 attempts.
     ///
     /// Tracing info might not be available immediately on queried node - that's why
@@ -844,7 +888,7 @@ impl<K: SessionBuilderKind> GenericSessionBuilder<K> {
     }
 
     /// Set the delay between attempts to fetch [TracingInfo](crate::tracing::TracingInfo)
-    /// in [`Session::get_tracing_info`].
+    /// in [`Session::get_tracing_info`](crate::Session::get_tracing_info).
     /// The default is 3 milliseconds.
     ///
     /// Tracing info might not be available immediately on queried node - that's why
@@ -873,7 +917,7 @@ impl<K: SessionBuilderKind> GenericSessionBuilder<K> {
     }
 
     /// Set the consistency level of fetching [TracingInfo](crate::tracing::TracingInfo)
-    /// in [`Session::get_tracing_info`].
+    /// in [`Session::get_tracing_info`](crate::Session::get_tracing_info).
     /// The default is [`Consistency::One`].
     ///
     /// # Example

@@ -1,14 +1,11 @@
 use assert_matches::assert_matches;
 
-use crate::batch::BatchType;
-use crate::query::Query;
-use crate::test_utils::setup_tracing;
-use crate::transport::errors::{BadQuery, QueryError};
-use crate::{
-    batch::Batch,
-    test_utils::{create_new_session_builder, unique_keyspace_name},
-    QueryResult, Session,
-};
+use crate::utils::{create_new_session_builder, setup_tracing, unique_keyspace_name, PerformDDL};
+use scylla::batch::Batch;
+use scylla::batch::BatchType;
+use scylla::query::Query;
+use scylla::transport::errors::{BadQuery, QueryError};
+use scylla::{QueryResult, Session};
 
 #[tokio::test]
 async fn test_large_batch_statements() {
@@ -33,19 +30,15 @@ async fn test_large_batch_statements() {
 
 async fn create_test_session(session: Session, ks: &String) -> Session {
     session
-        .query_unpaged(
+        .ddl(
             format!("CREATE KEYSPACE {} WITH REPLICATION = {{ 'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1 }}",ks),
-            &[],
         )
         .await.unwrap();
     session
-        .query_unpaged(
-            format!(
-                "CREATE TABLE {}.pairs (dummy int, k blob, v blob, primary key (dummy, k))",
-                ks
-            ),
-            &[],
-        )
+        .ddl(format!(
+            "CREATE TABLE {}.pairs (dummy int, k blob, v blob, primary key (dummy, k))",
+            ks
+        ))
         .await
         .unwrap();
     session

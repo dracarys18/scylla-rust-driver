@@ -707,7 +707,7 @@ impl DefaultPolicy {
         cluster: &'a ClusterData,
         statement_type: StatementType,
         table_spec: &TableSpec,
-    ) -> Option<PickedReplica> {
+    ) -> Option<PickedReplica<'a>> {
         match statement_type {
             StatementType::Lwt => {
                 self.pick_first_replica(ts, replica_location, predicate, cluster, table_spec)
@@ -744,7 +744,7 @@ impl DefaultPolicy {
         predicate: impl Fn(NodeRef<'a>, Shard) -> bool + 'a,
         cluster: &'a ClusterData,
         table_spec: &TableSpec,
-    ) -> Option<PickedReplica> {
+    ) -> Option<PickedReplica<'a>> {
         match replica_location {
             NodeLocationCriteria::Any => {
                 // ReplicaSet returned by ReplicaLocator for this case:
@@ -819,11 +819,11 @@ impl DefaultPolicy {
         &'a self,
         ts: &TokenWithStrategy<'a>,
         replica_location: NodeLocationCriteria<'a>,
-        predicate: impl Fn(NodeRef<'_>, Shard) -> bool + 'a,
+        predicate: impl Fn(NodeRef<'a>, Shard) -> bool + 'a,
         cluster: &'a ClusterData,
         statement_type: StatementType,
         table_spec: &TableSpec,
-    ) -> impl Iterator<Item = (NodeRef<'_>, Shard)> {
+    ) -> impl Iterator<Item = (NodeRef<'a>, Shard)> {
         let order = match statement_type {
             StatementType::Lwt => ReplicaOrder::Deterministic,
             StatementType::NonLwt => ReplicaOrder::Arbitrary,
@@ -862,7 +862,7 @@ impl DefaultPolicy {
         &'a self,
         nodes: &'a [Arc<Node>],
         predicate: impl Fn(NodeRef<'a>) -> bool,
-    ) -> Option<NodeRef<'_>> {
+    ) -> Option<NodeRef<'a>> {
         // Select the first node that matches the predicate
         Self::randomly_rotated_nodes(nodes).find(|&node| predicate(node))
     }
@@ -873,7 +873,7 @@ impl DefaultPolicy {
         &'a self,
         nodes: &'a [Arc<Node>],
         predicate: impl Fn(NodeRef<'a>) -> bool,
-    ) -> impl Iterator<Item = NodeRef<'_>> {
+    ) -> impl Iterator<Item = NodeRef<'a>> {
         Self::randomly_rotated_nodes(nodes).filter(move |node| predicate(node))
     }
 
@@ -2860,7 +2860,9 @@ mod latency_awareness {
                 | QueryError::MetadataError(_)
                 | QueryError::ProtocolError(_)
                 | QueryError::TimeoutError
-                | QueryError::RequestTimeout(_) => true,
+                | QueryError::RequestTimeout(_)
+                | QueryError::NextRowError(_)
+                | QueryError::IntoLegacyQueryResultError(_) => true,
             }
         }
     }
@@ -3126,7 +3128,7 @@ mod latency_awareness {
         use crate::{
             load_balancing::default::NodeLocationPreference,
             routing::Shard,
-            test_utils::{create_new_session_builder, setup_tracing},
+            test_utils::setup_tracing,
             transport::locator::test::{TABLE_INVALID, TABLE_NTS_RF_2, TABLE_NTS_RF_3},
         };
         use crate::{
@@ -3139,7 +3141,6 @@ mod latency_awareness {
                 locator::test::{id_to_invalid_addr, A, B, C, D, E, F, G},
                 ClusterData, NodeAddr,
             },
-            ExecutionProfile,
         };
         use tokio::time::Instant;
 
@@ -3843,28 +3844,6 @@ mod latency_awareness {
                 )
                 .await;
             }
-        }
-
-        // This is a regression test for #696.
-        #[tokio::test]
-        #[ntest::timeout(1000)]
-        async fn latency_aware_query_completes() {
-            setup_tracing();
-            let policy = DefaultPolicy::builder()
-                .latency_awareness(LatencyAwarenessBuilder::default())
-                .build();
-            let handle = ExecutionProfile::builder()
-                .load_balancing_policy(policy)
-                .build()
-                .into_handle();
-
-            let session = create_new_session_builder()
-                .default_execution_profile_handle(handle)
-                .build()
-                .await
-                .unwrap();
-
-            session.query_unpaged("whatever", ()).await.unwrap_err();
         }
 
         #[tokio::test(start_paused = true)]

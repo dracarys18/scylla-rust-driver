@@ -3,8 +3,12 @@ use rustyline::completion::{Completer, Pair};
 use rustyline::error::ReadlineError;
 use rustyline::{CompletionType, Config, Context, Editor};
 use rustyline_derive::{Helper, Highlighter, Hinter, Validator};
+use scylla::frame::response::result::Row;
+use scylla::transport::query_result::IntoRowsResultError;
+use scylla::transport::session::Session;
 use scylla::transport::Compression;
-use scylla::{QueryResult, Session, SessionBuilder};
+use scylla::QueryResult;
+use scylla::SessionBuilder;
 use std::env;
 
 #[derive(Helper, Highlighter, Validator, Hinter)]
@@ -173,23 +177,30 @@ impl Completer for CqlHelper {
     }
 }
 
-fn print_result(result: &QueryResult) {
-    if result.rows.is_none() {
-        println!("OK");
-        return;
-    }
-    for row in result.rows.as_ref().unwrap() {
-        for column in &row.columns {
-            print!("|");
-            print!(
-                " {:16}",
-                match column {
-                    None => "null".to_owned(),
-                    Some(value) => format!("{:?}", value),
+fn print_result(result: QueryResult) -> Result<(), IntoRowsResultError> {
+    match result.into_rows_result() {
+        Ok(rows_result) => {
+            for row in rows_result.rows::<Row>().unwrap() {
+                let row = row.unwrap();
+                for column in &row.columns {
+                    print!("|");
+                    print!(
+                        " {:16}",
+                        match column {
+                            None => "null".to_owned(),
+                            Some(value) => format!("{:?}", value),
+                        }
+                    );
                 }
-            );
+                println!("|");
+            }
+            Ok(())
         }
-        println!("|")
+        Err(IntoRowsResultError::ResultNotRows(_)) => {
+            println!("OK");
+            Ok(())
+        }
+        Err(e) => Err(e),
     }
 }
 
@@ -222,7 +233,7 @@ async fn main() -> Result<()> {
                 let maybe_res = session.query_unpaged(line, &[]).await;
                 match maybe_res {
                     Err(err) => println!("Error: {}", err),
-                    Ok(res) => print_result(&res),
+                    Ok(res) => print_result(res)?,
                 }
             }
             Err(ReadlineError::Interrupted) => continue,

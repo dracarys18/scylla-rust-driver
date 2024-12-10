@@ -1,9 +1,8 @@
-use crate::{
-    batch::Batch,
-    prepared_statement::PreparedStatement,
-    test_utils::{create_new_session_builder, setup_tracing, unique_keyspace_name},
-    Session,
-};
+use crate::utils::{create_new_session_builder, setup_tracing, unique_keyspace_name, PerformDDL};
+use scylla::batch::Batch;
+use scylla::prepared_statement::PreparedStatement;
+use scylla::Session;
+
 use std::collections::BTreeSet;
 
 #[tokio::test]
@@ -12,14 +11,11 @@ async fn test_quietly_prepare_batch() {
     let session = create_new_session_builder().build().await.unwrap();
 
     let ks = unique_keyspace_name();
-    session.query_unpaged(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks), &[]).await.unwrap();
+    session.ddl(format!("CREATE KEYSPACE IF NOT EXISTS {} WITH REPLICATION = {{'class' : 'NetworkTopologyStrategy', 'replication_factor' : 1}}", ks)).await.unwrap();
     session.use_keyspace(ks.clone(), false).await.unwrap();
 
     session
-        .query_unpaged(
-            "CREATE TABLE test_batch_table (a int, b int, primary key (a, b))",
-            (),
-        )
+        .ddl("CREATE TABLE test_batch_table (a int, b int, primary key (a, b))")
         .await
         .unwrap();
 
@@ -96,7 +92,9 @@ async fn assert_test_batch_table_rows_contain(sess: &Session, expected_rows: &[(
         .query_unpaged("SELECT a, b FROM test_batch_table", ())
         .await
         .unwrap()
-        .rows_typed::<(i32, i32)>()
+        .into_rows_result()
+        .unwrap()
+        .rows::<(i32, i32)>()
         .unwrap()
         .map(|r| r.unwrap())
         .collect();
